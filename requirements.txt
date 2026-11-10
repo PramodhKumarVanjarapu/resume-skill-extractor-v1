@@ -1,12 +1,22 @@
-# section_detector.py itself is stdlib-only.
-# --- test harness (app.py) ---
+# Core modules (section_detector, technology_matcher, project_extractor) use ONLY the standard library.
+# Nothing here is needed to run them or their tests:  python -m unittest discover -s tests
+
+# --- test harness: streamlit run app.py ---
 streamlit>=1.30
 pandas>=2.0
-requests>=2.31
+requests>=2.31          # also used by analyzer.py / resume.py (GitHub API, resume download)
 pdfplumber>=0.10
-pypdf>=4.0
+pypdf>=4.0              # also used by resume.py to read PDF hyperlinks
 python-docx>=1.0
-# --- later phases ---
-spacy>=3.7,<4
-flashtext>=2.7
-pytest>=8.0   # optional: tests are plain unittest and also run with `python -m unittest`
+xlsxwriter>=3.1        # formatted output.xlsx download (the CSV download works without it)
+
+# --- GitHub columns (app/github_enricher.py) ---
+# Also needs the `git` command on PATH and network access to github.com / api.github.com.
+# python-dotenv>=1.0    # optional: read GITHUB_TOKEN from a .env file
+
+# --- optional ---
+# flashtext>=2.7        # alternative matching engine: TechnologyMatcher(engine="flashtext")
+# pytest>=8.0           # tests are plain unittest; pytest also collects them
+# reportlab>=4.0        # only for the PDF-link test in tests/test_github_enricher.py (skipped if missing)
+# openpyxl>=3.1         # only to read the .xlsx back in tests/test_xlsx_export.py (skipped if missing)
+# spaCy is NOT used by any module (see README: possible improvements).

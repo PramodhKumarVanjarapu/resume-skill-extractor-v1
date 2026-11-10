@@ -44,6 +44,7 @@ import requests
 
 sys.path.insert(0, str(Path(__file__).resolve().parent / "app"))
 import github_enricher  # noqa: E402
+import xlsx_export  # noqa: E402
 import section_detector  # noqa: E402
 import project_extractor  # noqa: E402
 import technology_matcher  # noqa: E402
@@ -648,6 +649,12 @@ def output_csv_bytes(df: pd.DataFrame, include_diagnostics: bool = False, excel_
     return to_csv_bytes(out)
 
 
+def output_xlsx_bytes(df: pd.DataFrame, include_diagnostics: bool = False) -> bytes:
+    """output.xlsx: the same columns as output.csv, with formatting (styled frozen header, column widths,
+    wrapped text, phone numbers stored as text). Needs ``xlsxwriter``; raises ImportError without it."""
+    return xlsx_export.dataframe_to_xlsx(df, output_columns(df, include_diagnostics))
+
+
 # --------------------------------------------------------------------------- #
 # Streamlit UI
 # --------------------------------------------------------------------------- #
@@ -678,8 +685,9 @@ def main() -> None:
         )
         excel_phone = st.checkbox(
             "Excel-safe phone numbers", value=False,
-            help="Writes phones as =\"0881...\" so Excel keeps leading zeros and does not show long numbers as "
-                 "9.19E+11. Leave off if you read the CSV with other tools.",
+            help="CSV only. Writes phones as =\"0881...\" so Excel keeps leading zeros and does not show long numbers "
+                 "as 9.19E+11. Not needed for the .xlsx download (phones are stored as text there). Leave off for "
+                 "Google Sheets and for other tools.",
         )
         include_raw = st.checkbox("Include raw extracted text in CSV", value=False)
         run_tech = st.checkbox("Run technology matcher", value=True)
@@ -845,8 +853,21 @@ def main() -> None:
         "Download output.csv", data=output_csv_bytes(df, include_diag, excel_phone), file_name="output.csv",
         mime="text/csv", type="primary",
     )
+    try:
+        xlsx_data: bytes | None = output_xlsx_bytes(df, include_diag)
+    except ImportError:
+        xlsx_data = None
+        st.info("For the formatted Excel / Google Sheets download, install xlsxwriter:  pip install xlsxwriter")
+    if xlsx_data is not None:
+        st.download_button(
+            "Download output.xlsx (formatted - best for Google Sheets / Excel)", data=xlsx_data, file_name="output.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
+    st.caption("Google Sheets: File > Import > Upload the **.xlsx** to keep column widths, the styled header and phone "
+               "numbers exactly as they are. A .csv cannot carry formatting; if you import the CSV, untick "
+               "'Convert text to numbers, dates and formulas' so Sheets does not drop leading zeros from phones.")
     csv_cols = output_columns(df, include_diag)
-    st.caption("output.csv contains: " + ", ".join(csv_cols))
+    st.caption("output.csv / output.xlsx contain: " + ", ".join(csv_cols))
     st.caption("Save the file with the **Download output.csv** button. The table below shows exactly the same columns "
                "(no row numbers). Rows that failed show blank cells; their reasons are listed under Failures.")
     # Text only: mixed ""/number columns would otherwise break the table, and the table never shows more than the CSV.
