@@ -113,12 +113,24 @@ class ResumeError(Exception):
 _URL_RE = re.compile(r"(?:https?://|www\.)\S+", re.IGNORECASE)
 
 
+def _digit_count(cell: str) -> int:
+    return sum(ch.isdigit() for ch in cell)
+
+
+def _looks_like_phone(cell: str) -> bool:
+    """Mostly digits and at least 7 of them ("98765 43210", "+91-98765-43210", even "0l8897228905")."""
+    compact = cell.replace(" ", "")
+    return bool(compact) and _digit_count(compact) >= 7 and _digit_count(compact) / len(compact) >= 0.6
+
+
 def parse_pasted(text: str) -> list[tuple[str, str]]:
     """Parse lines like ``+91 98765 43210, https://...`` into (phone, link).
 
-    The URL is located by pattern, so separators (comma/tab/pipe/space) and
-    phone formatting don't matter. A line with no URL is kept with an empty
-    link so the user sees it fail in the CSV instead of vanishing.
+    The URL is located by pattern, so separators (comma/tab/pipe/semicolon) don't matter. The
+    remaining cells are searched for the phone number, so extra columns (a name, "NA", ...) are
+    ignored instead of being glued onto the phone. If no cell looks like a phone number the first
+    remaining cell is used. A line with no URL keeps an empty link, so the row still appears in the
+    output (as a failure) instead of vanishing.
     """
     entries: list[tuple[str, str]] = []
     for line in text.splitlines():
@@ -126,11 +138,10 @@ def parse_pasted(text: str) -> list[tuple[str, str]]:
         if not line or line.startswith("#"):
             continue
         m = _URL_RE.search(line)
-        if m:
-            link = m.group(0).rstrip(",;)\"'")
-            phone = (line[: m.start()] + line[m.end():]).strip(" ,;\t|")
-        else:
-            phone, link = line.strip(" ,;\t|"), ""
+        link = m.group(0).rstrip(",;)\"'") if m else ""
+        rest = (line[: m.start()] + "\t" + line[m.end():]) if m else line
+        cells = [c.strip() for c in re.split(r"[\t,;|]+", rest) if c.strip()]
+        phone = next((c for c in cells if _looks_like_phone(c)), cells[0] if cells else "")
         entries.append((phone, link))
     return entries
 
@@ -538,18 +549,59 @@ def run_github(
     token: str | None = None,
     skip_forks: bool = True,
     progress_cb: Callable[[int, int], None] | None = None,
+    max_profiles: int | None = None,
+    rate: github_enricher.RateLimit | None = None,
 ) -> list[Processed]:
     """Fill repos_count, github_tech_stack, project_categories, github_status and github_notes.
 
     Only resumes that were read (status ok / partial) take part. The GitHub profile column is
-    filled earlier, so it is present even when this step is skipped. Never raises.
+    filled earlier, so it is present even when this step is skipped. ``max_profiles`` / ``rate``
+    come from ``github_enricher.rate_limit_status``: profiles that do not fit in the remaining API
+    quota are skipped with a clear note instead of failing halfway. Never raises.
     """
     targets = [p for p in items if p.row["status"] in ("ok", "partial")]
-    infos = github_enricher.analyze_profiles([p.profiles for p in targets], token, skip_forks, progress_cb)
+    infos = github_enricher.analyze_profiles(
+        [p.profiles for p in targets], token, skip_forks, progress_cb, max_profiles=max_profiles, rate=rate
+    )
     for p, info in zip(targets, infos):
         p.github = info
         p.row.update(info.columns())
     return items
+
+
+def github_summary_messages(
+    summary: dict[str, int], rate: github_enricher.RateLimit | None = None
+) -> list[tuple[str, str]]:
+    """Plain-language outcome of the GitHub step as (level, text); level is a Streamlit message type.
+
+    Exists so a half-empty github_* column is never a mystery: every blank is explained here
+    (and per row in the github_status / github_notes diagnostic columns).
+    """
+    out: list[tuple[str, str]] = []
+    if summary.get("done"):
+        out.append(("caption", f"GitHub: {summary['done']} resume(s) analysed."))
+    if summary.get("skipped_rate_limit"):
+        when = f" The limit resets at {rate.reset_text()}." if rate else ""
+        if rate and not rate.authenticated:
+            fix = "Add a GitHub token (5,000 requests/hour instead of 60), or re-run these rows after the reset."
+        else:
+            fix = "Re-run these rows after the limit resets."
+        out.append(("warning", f"GitHub: {summary['skipped_rate_limit']} resume(s) were SKIPPED because the GitHub API "
+                               f"request limit was too low for the whole batch.{when} {fix}"))
+    if summary.get("rate_limited"):
+        out.append(("warning", f"GitHub: {summary['rate_limited']} resume(s) FAILED because the API request limit ran out "
+                               f"during the run. Add a GitHub token, or re-run these rows later."))
+    if summary.get("bad_token"):
+        out.append(("error", f"GitHub: {summary['bad_token']} resume(s) failed because the GitHub token is invalid or expired."))
+    if summary.get("user_not_found"):
+        out.append(("info", f"GitHub: {summary['user_not_found']} profile(s) do not exist on GitHub (mistyped or placeholder "
+                            f"usernames in the resume)."))
+    if summary.get("failed_other"):
+        out.append(("warning", f"GitHub: {summary['failed_other']} resume(s) failed for other reasons; tick 'Add diagnostic "
+                               f"columns' to see github_notes."))
+    if summary.get("no_github_profile"):
+        out.append(("caption", f"GitHub: {summary['no_github_profile']} resume(s) contain no GitHub profile."))
+    return out
 
 
 def to_dataframe(items: list[Processed], include_raw_text: bool = False) -> pd.DataFrame:
@@ -574,9 +626,26 @@ def output_columns(df: pd.DataFrame, include_diagnostics: bool = False) -> list[
     return cols
 
 
-def output_csv_bytes(df: pd.DataFrame, include_diagnostics: bool = False) -> bytes:
-    """The downloadable output.csv (exactly the requested columns, in order)."""
-    return to_csv_bytes(df[output_columns(df, include_diagnostics)])
+_EXCEL_PHONE = re.compile(r"^\+?\d[\d ]*$")
+
+
+def excel_safe_phone(value: object) -> str:
+    """``08810931580`` -> ``="08810931580"``: Excel then shows the number as typed instead of dropping the
+    leading zero or switching long numbers to scientific notation. Anything that is not plain digits is untouched."""
+    text = str(value)
+    return f'="{text}"' if _EXCEL_PHONE.match(text) else text
+
+
+def output_csv_bytes(df: pd.DataFrame, include_diagnostics: bool = False, excel_phone: bool = False) -> bytes:
+    """The downloadable output.csv: exactly the requested columns, in order, no row-number column.
+
+    ``excel_phone=True`` writes phone numbers as ="..." so Excel keeps leading zeros (other tools,
+    e.g. pandas, then see those extra characters).
+    """
+    out = df[output_columns(df, include_diagnostics)].copy()
+    if excel_phone and "phone" in out.columns:
+        out["phone"] = out["phone"].map(excel_safe_phone)
+    return to_csv_bytes(out)
 
 
 # --------------------------------------------------------------------------- #
@@ -607,6 +676,11 @@ def main() -> None:
             help="status, error, review flags, per-project technologies (projects_summary), "
                  "unrecognised technologies and warnings",
         )
+        excel_phone = st.checkbox(
+            "Excel-safe phone numbers", value=False,
+            help="Writes phones as =\"0881...\" so Excel keeps leading zeros and does not show long numbers as "
+                 "9.19E+11. Leave off if you read the CSV with other tools.",
+        )
         include_raw = st.checkbox("Include raw extracted text in CSV", value=False)
         run_tech = st.checkbox("Run technology matcher", value=True)
         run_projects = st.checkbox("Extract projects (per-project technologies)", value=True)
@@ -629,6 +703,9 @@ def main() -> None:
             "GitHub token (optional)", value=os.getenv("GITHUB_TOKEN", ""), type="password",
             help="Read from GITHUB_TOKEN if set. Without a token GitHub allows 60 API requests per hour.",
         )
+        if run_gh and not gh_token.strip():
+            st.warning("No GitHub token: GitHub allows only 60 API requests per hour, so a batch with more than "
+                       "about 55 GitHub profiles can only be analysed in part.")
         skip_forks = st.checkbox("Skip forked repositories", value=True, help="Forks are mostly other people's code.")
         st.caption(f"section_detector: `{section_detector.__file__}`")
         st.caption(f"technology_matcher: `{technology_matcher.__file__}`")
@@ -711,6 +788,7 @@ def main() -> None:
         )
         bar.empty()
 
+        st.session_state["github_summary"] = None            # never show a previous run's outcome
         if run_gh:
             if not github_enricher.git_available():
                 st.error("GitHub analysis skipped: the `git` command was not found. Install git, or untick "
@@ -724,8 +802,24 @@ def main() -> None:
                     else:
                         gbar.progress(0.0, text="Finding GitHub repositories...")
 
-                run_github(items, gh_token.strip() or None, skip_forks, gh_progress)
+                token = gh_token.strip() or None
+                rate = github_enricher.rate_limit_status(token)       # free call; None if it cannot be read
+                budget = None
+                if rate is not None:
+                    needed = len({u.lower() for p in items for u in p.profiles})
+                    budget = rate.budget()
+                    if needed > budget:
+                        st.warning(
+                            f"GitHub API quota: {rate.remaining} of {rate.limit} requests left"
+                            f"{'' if rate.authenticated else ' (no token)'}, but {needed} distinct profiles need one each. "
+                            f"Only the first {budget} will be analysed now; the rest are marked as skipped (quota resets "
+                            f"at {rate.reset_text()}). Add a GitHub token to analyse them all."
+                        )
+                run_github(items, token, skip_forks, gh_progress, max_profiles=budget, rate=rate)
                 gbar.empty()
+                st.session_state["github_summary"] = (
+                    github_enricher.summarize(p.github for p in items if p.github is not None), rate,
+                )
             else:
                 st.info("No GitHub profile was found in any resume, so there was nothing to analyse.")
         st.session_state["items"] = items
@@ -744,14 +838,19 @@ def main() -> None:
     m3.metric("Failed / partial", len(df) - ok)
     m4.metric("Wall time (s)", f"{st.session_state.get('elapsed', 0):.1f}")
 
+    for level, text in github_summary_messages(*(st.session_state.get("github_summary") or ({}, None))):
+        getattr(st, level)(text)
+
     st.download_button(
-        "Download output.csv", data=output_csv_bytes(df, include_diag), file_name="output.csv", mime="text/csv",
+        "Download output.csv", data=output_csv_bytes(df, include_diag, excel_phone), file_name="output.csv",
+        mime="text/csv", type="primary",
     )
-    shown_cols = output_columns(df, include_diag)
-    if "status" not in shown_cols:                 # failures must stay visible on screen
-        shown_cols = shown_cols[:2] + ["status"] + shown_cols[2:]
-    st.caption("output.csv contains: " + ", ".join(output_columns(df, include_diag)))
-    st.dataframe(df[shown_cols])
+    csv_cols = output_columns(df, include_diag)
+    st.caption("output.csv contains: " + ", ".join(csv_cols))
+    st.caption("Save the file with the **Download output.csv** button. The table below shows exactly the same columns "
+               "(no row numbers). Rows that failed show blank cells; their reasons are listed under Failures.")
+    # Text only: mixed ""/number columns would otherwise break the table, and the table never shows more than the CSV.
+    st.dataframe(df[csv_cols].astype(str), hide_index=True)
 
     failed = df[df["status"] != "ok"]
     if len(failed):
