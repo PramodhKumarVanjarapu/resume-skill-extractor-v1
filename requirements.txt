@@ -1,0 +1,12 @@
+# section_detector.py itself is stdlib-only.
+# --- test harness (app.py) ---
+streamlit>=1.30
+pandas>=2.0
+requests>=2.31
+pdfplumber>=0.10
+pypdf>=4.0
+python-docx>=1.0
+# --- later phases ---
+spacy>=3.7,<4
+flashtext>=2.7
+pytest>=8.0   # optional: tests are plain unittest and also run with `python -m unittest`
