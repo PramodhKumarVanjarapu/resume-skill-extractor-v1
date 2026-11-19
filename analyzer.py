@@ -31,7 +31,7 @@ import requests
 from resume import read_resume
 
 WORKERS = 15              # repositories analysed at the same time
-LIST_WORKERS = 4          # profiles whose repo lists are fetched at the same time
+LIST_WORKERS = 12         # profiles whose repo lists are fetched at the same time (network wait only)
 RESUME_WORKERS = 4        # resumes downloaded and read at the same time
 MAX_MANIFESTS = 15        # dependency files read per repo
 MAX_CODE_FILES = 10       # .py / .ipynb files scanned for imports per repo
@@ -40,6 +40,9 @@ MAX_CODE_SIZE = 5_000_000
 GIT_TIMEOUT = 90          # seconds before a stuck git command is killed
 CACHE_VERSION = "v5"      # bump when detection logic changes
 CACHE_FILE = "tech-cache.json"
+# All temporary clones go under this one folder, so it can be excluded from antivirus scanning
+# (Windows Defender scans every file git writes, which slows clones down a lot).
+CLONE_ROOT = os.path.join(tempfile.gettempdir(), "tech-analyzer")
 
 # =====================================================================
 # Technology tables. Patterns ending in "*" are prefix matches.
@@ -573,7 +576,8 @@ def analyze_repository(repo: dict) -> dict:
     if repo.get("size") == 0:
         return finish()
 
-    tmp = tempfile.mkdtemp(prefix="tech-analyzer-")
+    os.makedirs(CLONE_ROOT, exist_ok=True)
+    tmp = tempfile.mkdtemp(prefix="repo-", dir=CLONE_ROOT)
     try:
         # 1. Blobless clone: file names only, no contents.
         git([

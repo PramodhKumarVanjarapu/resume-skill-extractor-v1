@@ -500,7 +500,7 @@ _TRIGGERS = frozenset(
     "using use used uses with in via on and or of for from by built develop developed "
     "developing written write wrote code coded coding implemented programmed programming "
     "language languages skills skill stack tools tool technologies framework frameworks "
-    "proficient experienced experience knowledge expertise familiar familiarity".split()
+    "proficient experienced experience knowledge expertise familiar familiarity technology tech".split()
 )
 _FOLLOW_WORDS = frozenset(
     "language languages programming lang framework developer developers backend library "
@@ -531,9 +531,9 @@ def _judge_ambiguous(
         return False, "season/semester usage", True
     if len(raw) == 1 and after[:1] == "&":
         return False, "looks like an abbreviation (e.g. R&D)", True
-    others = sorted(supporting - {name})
-    if others:
-        return True, f"ambiguous term accepted: co-occurs with {others[0]}", False
+    # NOTE: mere co-occurrence of another technology in the same sentence is NOT enough
+    # ("Go to the dashboard and view data in MongoDB"). Neighbour/list adjacency is
+    # handled in pass 2 of find_all().
     if len(raw) == 1 and _INITIAL_AFTER.match(after):
         return False, "looks like a person's initial", True
     prev = _PREV_WORD.search(before)
@@ -700,8 +700,12 @@ class TechnologyMatcher:
                 for j in (i - 1, i + 1):
                     if not (0 <= j < len(candidates)) or sentences[j] != sentences[i]:
                         continue
-                    if j not in verdict or not verdict[j][0]:
-                        continue
+                    if j in verdict:
+                        if not verdict[j][0]:
+                            continue
+                    elif candidates[j].info.exact is not None:
+                        continue  # ambiguous term with wrong case: not a technology
+                    # else: unambiguous neighbour technology => may support this term
                     lo, hi = sorted((i, j))
                     if _LIST_CONNECTOR.match(text[candidates[lo].end:candidates[hi].start]):
                         verdict[i] = (True, f"ambiguous term accepted: adjacent to {candidates[j].info.name}")

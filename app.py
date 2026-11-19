@@ -13,6 +13,9 @@ Output: output.csv - one row per resume with exactly these columns:
         its repositories - see github_enricher.py; the optional sidebar box
         "Add diagnostic columns" appends status, error, review flags,
         per-project technologies, GitHub status/notes and warnings.)
+        Below the table, a live "Filter profiles" panel narrows the profiles
+        (technologies, counts, phone lists from Excel ...) and downloads exactly
+        the filtered rows; a second panel filters a CSV / Excel file saved earlier.
         The on-screen inspector always shows the full detail: extracted text,
         detected sections, technology matches and projects with evidence.
 
@@ -34,7 +37,9 @@ import re
 import sys
 import time
 import zipfile
-from concurrent.futures import ThreadPoolExecutor, as_completed
+import threading
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
+from concurrent.futures.process import BrokenProcessPool
 from pathlib import Path
 from typing import Callable, Iterable
 from urllib.parse import parse_qs, urlparse
@@ -43,7 +48,26 @@ import pandas as pd
 import requests
 
 sys.path.insert(0, str(Path(__file__).resolve().parent / "app"))
+
+# Every module this file imports. A missing one used to surface as "No module named 'filter_panel'"; say which files
+# are missing and where they belong instead.
+REQUIRED_MODULES = (
+    "section_detector", "technology_matcher", "project_extractor", "github_profile", "github_enricher", "analyzer",
+    "resume", "profile_filter", "filter_panel", "xlsx_export", "pdf_parse",
+)
+_here = Path(__file__).resolve().parent
+_missing = [f"{name}.py" for name in REQUIRED_MODULES
+            if not (_here / "app" / f"{name}.py").exists() and not (_here / f"{name}.py").exists()]
+if _missing:
+    raise ImportError(
+        "app.py cannot start: these files are missing: " + ", ".join(_missing)
+        + f". Put them in the folder '{_here / 'app'}' (next to the other modules) and run again. "
+          "The latest resume_extractor.zip contains all of them."
+    )
+import filter_panel  # noqa: E402
 import github_enricher  # noqa: E402
+import pdf_parse  # noqa: E402
+import profile_filter  # noqa: E402
 import xlsx_export  # noqa: E402
 import section_detector  # noqa: E402
 import project_extractor  # noqa: E402
@@ -60,6 +84,8 @@ from technology_matcher import (  # noqa: E402
 
 MAX_BYTES = 15 * 1024 * 1024          # refuse downloads larger than this
 MAX_PDF_PAGES = 20                    # resumes are short; cap pathological files
+# PDFs are parsed in separate processes (parsing is CPU work; threads cannot run it in parallel).
+PARSE_PROCESSES = max(1, min(8, (os.cpu_count() or 2) - 1))
 REQUEST_TIMEOUT = (10, 30)            # (connect, read) seconds
 USER_AGENT = "Mozilla/5.0 (compatible; ResumeSectionTester/1.0)"
 
@@ -79,11 +105,14 @@ TECH_COLUMNS = [f"tech_{k}" for k in TECH_SECTION_KEYS]
 PROJECT_COLUMNS = ["projects_summary", "unrecognized_technologies"]
 # github_profile, repos_count, github_tech_stack, project_categories, github_status, github_notes
 GITHUB_COLUMNS = github_enricher.GITHUB_COLUMNS
+# how sure we are that github_profile is the candidate's own account, and every candidate with its evidence
+PROFILE_SEARCH_COLUMNS = ["github_confidence", "github_candidates"]
 TAIL_COLUMNS = [
     "preamble", "sections_metadata", "technology_matches", "projects_json",
     "download_s", "parse_s", "detect_ms", "tech_ms", "project_ms",
 ]
-ALL_COLUMNS = BASE_COLUMNS + SECTION_KEYS + TECH_COLUMNS + PROJECT_COLUMNS + GITHUB_COLUMNS + TAIL_COLUMNS
+ALL_COLUMNS = (BASE_COLUMNS + SECTION_KEYS + TECH_COLUMNS + PROJECT_COLUMNS + GITHUB_COLUMNS
+               + PROFILE_SEARCH_COLUMNS + TAIL_COLUMNS)
 
 # The columns of the downloadable output.csv, in this order.
 OUTPUT_COLUMNS = [
@@ -95,7 +124,7 @@ OUTPUT_COLUMNS = [
 # Optional extras (sidebar checkbox) that explain failures and uncertainty.
 DIAGNOSTIC_COLUMNS = [
     "status", "error_stage", "error", "projects_needs_review", "projects_summary",
-    "unrecognized_technologies", "github_status", "github_notes", "warnings",
+    "unrecognized_technologies", "github_confidence", "github_candidates", "github_status", "github_notes", "warnings",
 ]
 
 
@@ -253,6 +282,45 @@ def detect_kind(data: bytes) -> str:
     return "unknown"
 
 
+_parse_pool: ProcessPoolExecutor | None = None
+_parse_pool_lock = threading.Lock()
+_parse_pool_broken = False
+
+
+def _get_parse_pool() -> ProcessPoolExecutor | None:
+    """One pool for the whole Streamlit server (module globals survive reruns); None = parse in-thread."""
+    global _parse_pool
+    if _parse_pool_broken:
+        return None
+    with _parse_pool_lock:
+        if _parse_pool is None:
+            _parse_pool = ProcessPoolExecutor(max_workers=PARSE_PROCESSES)
+        return _parse_pool
+
+
+def _fast_pdf(data: bytes) -> tuple[str, list[str]] | None:
+    """Text + hyperlinks in one PyMuPDF pass, in a worker process when possible.
+
+    None when PyMuPDF is not installed (the caller uses pdfplumber / pypdf instead).
+    Raises ResumeError("parse") when the PDF cannot be read.
+    """
+    global _parse_pool_broken
+    if not pdf_parse.available():
+        return None
+    pool = _get_parse_pool()
+    if pool is not None:
+        try:
+            return pool.submit(pdf_parse.pdf_text_and_links, data, MAX_PDF_PAGES).result()
+        except ValueError as e:
+            raise ResumeError("parse", f"PDF could not be read: {e}") from None
+        except (BrokenProcessPool, OSError, RuntimeError):
+            _parse_pool_broken = True          # worker processes cannot start here: parse in-thread from now on
+    try:
+        return pdf_parse.pdf_text_and_links(data, MAX_PDF_PAGES)
+    except ValueError as e:
+        raise ResumeError("parse", f"PDF could not be read: {e}") from None
+
+
 def _pdf_text(data: bytes) -> str:
     text = ""
     try:
@@ -351,13 +419,15 @@ class Processed:
         match_rows: list[dict] | None = None,
         project_result: ProjectExtractionResult | None = None,
         profiles: list[str] | None = None,
+        profile_search: github_enricher.ProfileSearch | None = None,
     ) -> None:
         self.row = row
         self.text = text
         self.result = result
         self.match_rows = match_rows or []
         self.project_result = project_result
-        self.profiles = profiles or []                       # GitHub usernames found in the resume
+        self.profiles = profiles or []                       # candidate usernames, the candidate's own account first
+        self.profile_search = profile_search                 # scores and reasons behind that order
         self.github: github_enricher.GitHubInfo | None = None   # filled by run_github()
 
 
@@ -423,6 +493,7 @@ def process_resume(
     detector: SectionDetector,
     matcher: TechnologyMatcher | None = None,
     extractor: ProjectExtractor | None = None,
+    blocked_accounts: tuple[str, ...] = (),
 ) -> Processed:
     """download -> parse -> detect sections -> match technologies -> extract projects for ONE resume.
 
@@ -434,6 +505,7 @@ def process_resume(
     row.update(phone=phone, resume_link=link, status="error", text_chars=0, num_sections=0)
     text, result, match_rows, project_result = "", None, [], None
     profiles: list[str] = []
+    profile_search: github_enricher.ProfileSearch | None = None
     early_warnings: list[str] = []
     try:
         url = normalize_url(link)
@@ -445,18 +517,35 @@ def process_resume(
         t0 = time.perf_counter()
         kind = detect_kind(data)
         row["file_type"] = kind
-        text = extract_text(data, kind)
+        fast = _fast_pdf(data) if kind == "pdf" else None
+        if fast is not None:
+            text = fast[0].replace("\x00", "")
+            if not text.strip():
+                raise ResumeError(
+                    "empty_text",
+                    "No extractable text (scanned/image-only file? OCR is not supported)",
+                )
+        else:
+            text = extract_text(data, kind)
         row["parse_s"] = round(time.perf_counter() - t0, 3)
         row["text_chars"] = len(text)
 
-        # GitHub profile: visible URLs plus links hidden behind text such as "GitHub"
-        # (PDF annotations / DOCX relationships). A failure here must not fail the resume.
+        # GitHub profile: every GitHub account mentioned (visible URLs plus links hidden behind text such as
+        # "GitHub": PDF annotations / DOCX relationships) is scored as evidence and ranked; github_profile is the
+        # best one. A failure here must not fail the resume.
         try:
-            profiles = github_enricher.find_profiles(text, github_enricher.extract_links(data, url))
+            # PDFs read by PyMuPDF already have their hyperlinks: no second parse.
+            links = fast[1] if fast is not None else github_enricher.extract_links(data, url)
+            profile_search = github_enricher.find_profile_candidates(
+                text, links, github_enricher.guess_name(text, link), extra_blocked=blocked_accounts
+            )
+            profiles = profile_search.usernames
+            row["github_confidence"] = profile_search.confidence
+            row["github_candidates"] = profile_search.describe()
         except Exception:  # noqa: BLE001
             profiles = []
             early_warnings.append("github:profile_detection_failed")
-        row["github_profile"] = "; ".join(github_enricher.profile_url(u) for u in profiles)
+        row["github_profile"] = github_enricher.profile_url(profiles[0]) if profiles else ""
 
         t0 = time.perf_counter()
         result = detector.detect(text)
@@ -519,23 +608,25 @@ def process_resume(
     except Exception as e:  # defensive: one bad file must not kill the batch
         row["error_stage"], row["error"] = "unexpected", f"{type(e).__name__}: {str(e)[:150]}"
     return Processed(
-        row=row, text=text, result=result, match_rows=match_rows, project_result=project_result, profiles=profiles
+        row=row, text=text, result=result, match_rows=match_rows, project_result=project_result, profiles=profiles,
+        profile_search=profile_search,
     )
 
 
 def run_batch(
     entries: list[tuple[str, str]],
     detector: SectionDetector,
-    workers: int = 4,
+    workers: int = 16,
     progress_cb: Callable[[int, int], None] | None = None,
     matcher: TechnologyMatcher | None = None,
     extractor: ProjectExtractor | None = None,
+    blocked_accounts: tuple[str, ...] = (),
 ) -> list[Processed]:
     """Process resumes concurrently (downloads are I/O bound); order preserved."""
     results: list[Processed | None] = [None] * len(entries)
     with ThreadPoolExecutor(max_workers=max(1, workers)) as pool:
         futures = {
-            pool.submit(process_resume, phone, link, detector, matcher, extractor): i
+            pool.submit(process_resume, phone, link, detector, matcher, extractor, blocked_accounts): i
             for i, (phone, link) in enumerate(entries)
         }
         for done, fut in enumerate(as_completed(futures), 1):
@@ -552,8 +643,14 @@ def run_github(
     progress_cb: Callable[[int, int], None] | None = None,
     max_profiles: int | None = None,
     rate: github_enricher.RateLimit | None = None,
+    all_profiles: bool = False,
+    max_repos: int | None = github_enricher.MAX_REPOS_PER_ACCOUNT,
 ) -> list[Processed]:
     """Fill repos_count, github_tech_stack, project_categories, github_status and github_notes.
+
+    By default only the best candidate account of each resume is analysed (the others are named in github_notes);
+    ``all_profiles=True`` merges the repositories of every account found. At most ``max_repos`` repositories are
+    analysed per account (the most recently updated), and GitHub organisations are refused after one request.
 
     Only resumes that were read (status ok / partial) take part. The GitHub profile column is
     filled earlier, so it is present even when this step is skipped. ``max_profiles`` / ``rate``
@@ -562,12 +659,52 @@ def run_github(
     """
     targets = [p for p in items if p.row["status"] in ("ok", "partial")]
     infos = github_enricher.analyze_profiles(
-        [p.profiles for p in targets], token, skip_forks, progress_cb, max_profiles=max_profiles, rate=rate
+        [p.profiles for p in targets], token, skip_forks, progress_cb, max_profiles=max_profiles, rate=rate,
+        all_profiles=all_profiles, max_repos=max_repos,
     )
     for p, info in zip(targets, infos):
         p.github = info
         p.row.update(info.columns())
     return items
+
+
+def profile_confidence_message(items: list[Processed]) -> tuple[str, str] | None:
+    """How sure the profile detection is across the batch, as (level, text); None if nothing was found.
+
+    Low confidence means the chosen account rests on weak evidence (for example a single repository link) or
+    on a tie between accounts; see the github_candidates diagnostic column for the reasons."""
+    counts = {"high": 0, "medium": 0, "low": 0}
+    for p in items:
+        level = p.row.get("github_confidence")
+        if level in counts:
+            counts[level] += 1
+    found = sum(counts.values())
+    if not found:
+        return None
+    text = (f"GitHub profile found in {found} resume(s): {counts['high']} high, {counts['medium']} medium, "
+            f"{counts['low']} low confidence.")
+    if counts["low"] or counts["medium"]:
+        text += " Tick 'Add diagnostic columns' to see github_candidates (every account found, with the evidence)."
+    return ("warning" if counts["low"] else "caption", text)
+
+
+def github_limits_message(items: list[Processed], cap: int | None) -> tuple[str, str] | None:
+    """Tell the user how many accounts hit the per-account repository cap (so the stack is from the newest repos only)."""
+    capped = [p for p in items if p.github is not None and any("most recently updated were analysed" in n for n in p.github.notes)]
+    if not capped or cap is None:
+        return None
+    return ("caption", f"GitHub: {len(capped)} account(s) have more than {cap} repositories, so only the {cap} most recently "
+                       f"updated were analysed (raise 'Max repositories analysed per account' in the sidebar to change this).")
+
+
+def parse_blocked_accounts(text: str) -> tuple[str, ...]:
+    """GitHub account names to ignore, typed one per line or separated by commas ("github.com/name" is accepted too)."""
+    names = []
+    for part in re.split(r"[,\n;]+", text or ""):
+        name = part.strip().rstrip("/").rsplit("/", 1)[-1].lstrip("@")
+        if name and name.lower() not in {n.lower() for n in names}:
+            names.append(name)
+    return tuple(names)
 
 
 def github_summary_messages(
@@ -594,6 +731,10 @@ def github_summary_messages(
                                f"during the run. Add a GitHub token, or re-run these rows later."))
     if summary.get("bad_token"):
         out.append(("error", f"GitHub: {summary['bad_token']} resume(s) failed because the GitHub token is invalid or expired."))
+    if summary.get("organisation"):
+        out.append(("info", f"GitHub: {summary['organisation']} resume(s) pointed only at GitHub organisations (a company or "
+                            f"project account, not a person) and no other account was found, so nothing was analysed for "
+                            f"them. They were probably linked from a project, not the candidate's own profile."))
     if summary.get("user_not_found"):
         out.append(("info", f"GitHub: {summary['user_not_found']} profile(s) do not exist on GitHub (mistyped or placeholder "
                             f"usernames in the resume)."))
@@ -637,22 +778,74 @@ def excel_safe_phone(value: object) -> str:
     return f'="{text}"' if _EXCEL_PHONE.match(text) else text
 
 
+def table_csv_bytes(frame: pd.DataFrame, columns: list[str], excel_phone: bool = False) -> bytes:
+    """UTF-8 (with BOM) CSV of ``frame[columns]``; ``excel_phone`` writes phones as ="..." (see ``excel_safe_phone``)."""
+    out = frame[columns].copy()
+    if excel_phone and "phone" in out.columns:
+        out["phone"] = out["phone"].map(excel_safe_phone)
+    return to_csv_bytes(out)
+
+
 def output_csv_bytes(df: pd.DataFrame, include_diagnostics: bool = False, excel_phone: bool = False) -> bytes:
     """The downloadable output.csv: exactly the requested columns, in order, no row-number column.
 
     ``excel_phone=True`` writes phone numbers as ="..." so Excel keeps leading zeros (other tools,
     e.g. pandas, then see those extra characters).
     """
-    out = df[output_columns(df, include_diagnostics)].copy()
-    if excel_phone and "phone" in out.columns:
-        out["phone"] = out["phone"].map(excel_safe_phone)
-    return to_csv_bytes(out)
+    return table_csv_bytes(df, output_columns(df, include_diagnostics), excel_phone)
 
 
 def output_xlsx_bytes(df: pd.DataFrame, include_diagnostics: bool = False) -> bytes:
     """output.xlsx: the same columns as output.csv, with formatting (styled frozen header, column widths,
     wrapped text, phone numbers stored as text). Needs ``xlsxwriter``; raises ImportError without it."""
     return xlsx_export.dataframe_to_xlsx(df, output_columns(df, include_diagnostics))
+
+
+def filter_alias_resolver(st):
+    """Resolver that lets the technology columns of the filter understand aliases (nodejs = Node.js); built once per
+    session. None if the dictionary cannot be loaded (the filter then simply matches the typed words)."""
+    if "flt_alias_resolver" not in st.session_state:
+        try:
+            st.session_state["flt_alias_resolver"] = profile_filter.alias_resolver(TechnologyMatcher())
+        except (DictionaryError, EngineUnavailable):
+            st.session_state["flt_alias_resolver"] = None
+    return st.session_state["flt_alias_resolver"]
+
+
+def render_profile_filter(st, df: pd.DataFrame, csv_cols: list[str], excel_phone: bool) -> None:
+    """Live filter panel for the profiles of this run: it filters exactly the columns of output.csv."""
+    st.divider()
+    st.subheader("Filter profiles")
+    st.caption("Narrow down the profiles above: results update as you type, and the downloads contain exactly the "
+               "profiles and columns you see here.")
+    table = df[csv_cols].apply(lambda column: column.map(profile_filter.cell_text))      # all text: nothing is type-guessed
+    filter_panel.render(
+        st, table, scope="results", alias_resolver=filter_alias_resolver(st),
+        csv_builder=lambda frame, cols: table_csv_bytes(frame, cols, excel_phone),
+    )
+
+
+def render_file_filter(st, excel_phone: bool) -> None:
+    """Filter a CSV / Excel file saved earlier (for example last week's output.csv) without running anything."""
+    with st.expander("Filter a CSV or Excel file you saved earlier"):
+        upload = st.file_uploader("output.csv or output.xlsx", type=["csv", "xlsx"], key="flt_file_upload")
+        if upload is None:
+            st.caption("Upload a file to filter it with the same panel. Nothing is type-guessed, so phone numbers keep "
+                       "their leading zeros.")
+            return
+        try:
+            table, notes = profile_filter.read_table(upload.getvalue(), upload.name)
+        except ValueError as exc:
+            st.error(str(exc))
+            return
+        for note in notes:
+            st.caption(note)
+        st.caption(f"{len(table)} rows, {len(table.columns)} columns")
+        filter_panel.render(
+            st, table, scope="file", alias_resolver=filter_alias_resolver(st),
+            csv_builder=lambda frame, cols: table_csv_bytes(frame, cols, excel_phone),
+            file_stem=f"{Path(upload.name).stem}_filtered",
+        )
 
 
 # --------------------------------------------------------------------------- #
@@ -677,7 +870,7 @@ def main() -> None:
 
     with st.sidebar:
         st.header("Options")
-        workers = st.slider("Parallel downloads", 1, 16, 4)
+        workers = st.slider("Parallel downloads", 1, 50, 16)
         include_diag = st.checkbox(
             "Add diagnostic columns to the CSV", value=False,
             help="status, error, review flags, per-project technologies (projects_summary), "
@@ -715,6 +908,23 @@ def main() -> None:
             st.warning("No GitHub token: GitHub allows only 60 API requests per hour, so a batch with more than "
                        "about 55 GitHub profiles can only be analysed in part.")
         skip_forks = st.checkbox("Skip forked repositories", value=True, help="Forks are mostly other people's code.")
+        max_repos = int(st.number_input(
+            "Max repositories analysed per account", min_value=10, max_value=500, value=github_enricher.MAX_REPOS_PER_ACCOUNT,
+            step=10, help="Protects against huge accounts: each repository is cloned and scanned. Accounts with more get "
+                          "their most recently updated repositories, and GitHub organisations (google, linkedin, ...) are "
+                          "skipped after one request.",
+        ))
+        blocked_text = st.text_area(
+            "GitHub accounts to ignore (one per line)", height=70, placeholder="some-company\nsome-course-org",
+            help="Names that should never be taken as a candidate's profile. Well-known organisations "
+                 "(google, linkedin, microsoft, ...) are already ignored.",
+        )
+        all_profiles = st.checkbox(
+            "Analyse every GitHub account found (not only the best match)", value=False,
+            help="Off (recommended): only the account that best looks like the candidate's own is analysed; the others "
+                 "are listed in github_notes. On: the repositories of every account mentioned are merged, which mixes "
+                 "in other people's and organisations' work.",
+        )
         st.caption(f"section_detector: `{section_detector.__file__}`")
         st.caption(f"technology_matcher: `{technology_matcher.__file__}`")
         st.caption(f"project_extractor: `{project_extractor.__file__}`")
@@ -793,6 +1003,7 @@ def main() -> None:
             progress_cb=lambda d, n: bar.progress(d / n, text=f"{d}/{n} processed"),
             matcher=matcher,
             extractor=extractor,
+            blocked_accounts=parse_blocked_accounts(blocked_text),
         )
         bar.empty()
 
@@ -814,7 +1025,7 @@ def main() -> None:
                 rate = github_enricher.rate_limit_status(token)       # free call; None if it cannot be read
                 budget = None
                 if rate is not None:
-                    needed = len({u.lower() for p in items for u in p.profiles})
+                    needed = len({u.lower() for p in items for u in (p.profiles if all_profiles else p.profiles[:1])})
                     budget = rate.budget()
                     if needed > budget:
                         st.warning(
@@ -823,7 +1034,9 @@ def main() -> None:
                             f"Only the first {budget} will be analysed now; the rest are marked as skipped (quota resets "
                             f"at {rate.reset_text()}). Add a GitHub token to analyse them all."
                         )
-                run_github(items, token, skip_forks, gh_progress, max_profiles=budget, rate=rate)
+                run_github(items, token, skip_forks, gh_progress, max_profiles=budget, rate=rate, all_profiles=all_profiles,
+                           max_repos=max_repos)
+                st.session_state["github_max_repos"] = max_repos
                 gbar.empty()
                 st.session_state["github_summary"] = (
                     github_enricher.summarize(p.github for p in items if p.github is not None), rate,
@@ -836,6 +1049,7 @@ def main() -> None:
 
     items = st.session_state.get("items")
     if not items:
+        render_file_filter(st, excel_phone)
         return
 
     df = to_dataframe(items, st.session_state.get("include_raw", False))
@@ -848,6 +1062,12 @@ def main() -> None:
 
     for level, text in github_summary_messages(*(st.session_state.get("github_summary") or ({}, None))):
         getattr(st, level)(text)
+    confidence = profile_confidence_message(items)
+    if confidence:
+        getattr(st, confidence[0])(confidence[1])
+    limits = github_limits_message(items, st.session_state.get("github_max_repos"))
+    if limits:
+        getattr(st, limits[0])(limits[1])
 
     st.download_button(
         "Download output.csv", data=output_csv_bytes(df, include_diag, excel_phone), file_name="output.csv",
@@ -878,6 +1098,9 @@ def main() -> None:
         st.subheader("Failures")
         st.dataframe(failed[["phone", "resume_link", "status", "error_stage", "error"]])
 
+    render_profile_filter(st, df, csv_cols, excel_phone)
+    render_file_filter(st, excel_phone)
+
     st.subheader("Inspector")
     shown = [p for p in items if p.result is not None][:100]
     if len(items) > len(shown):
@@ -905,6 +1128,8 @@ def main() -> None:
                     st.code(s.text or "(empty)", language=None)
             if p.row["github_profile"]:
                 st.markdown("**GitHub**")
+                if p.profile_search is not None and p.profile_search.candidates:
+                    st.write(f"Profile confidence: {p.profile_search.confidence}  |  evidence: " + p.profile_search.describe())
                 if p.github is not None and p.github.status:
                     st.write(
                         f"{p.row['github_profile']}  |  repositories: {p.row['repos_count'] or '-'}  |  "
