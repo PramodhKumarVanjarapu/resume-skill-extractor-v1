@@ -46,6 +46,7 @@ import pandas as pd
 import requests
 import candidate_ranker
 import experience_extractor
+import internal_projects
 import project_repo_matcher
 
 sys.path.insert(0, str(Path(__file__).resolve().parent / "app"))
@@ -101,7 +102,8 @@ BASE_COLUMNS = [
 # "other" = headings we recognise but do not export (Hobbies, Languages, ...).
 TECH_SECTION_KEYS = SECTION_KEYS + ["preamble", "other"]
 TECH_COLUMNS = [f"tech_{k}" for k in TECH_SECTION_KEYS]
-PROJECT_COLUMNS = ["projects_summary", "unrecognized_technologies", "inferred_technologies"]
+# internal_projects: resume projects assigned by the training company, removed from every project/technology column
+PROJECT_COLUMNS = ["projects_summary", "unrecognized_technologies", "inferred_technologies", "internal_projects"]
 EVIDENCE_COLUMNS = [
     "github_evidence_details", "verified_project_repositories", "project_repo_match_confidence",
     "experience_evidence_details", "internship_evidence_details", "recent_repositories_count",
@@ -129,7 +131,7 @@ OUTPUT_COLUMNS = [
 ]
 # Optional extras (sidebar checkbox) that explain failures and uncertainty.
 DIAGNOSTIC_COLUMNS = [
-    "status", "error_stage", "error", "projects_needs_review", "projects_summary",
+    "status", "error_stage", "error", "projects_needs_review", "projects_summary", "internal_projects",
     "unrecognized_technologies", "inferred_technologies", "github_confidence", "github_candidates", "github_status",
     "github_notes", "warnings",
 ]
@@ -456,7 +458,11 @@ def match_technologies(
     Includes skills implied by a written technology (``match_type="inferred"``,
     e.g. "Deep Learning" from "PyTorch") so skill columns and filters see them.
     """
-    matches = matcher.find_all(text, include_inferred=True)
+    return technology_rows(matcher.find_all(text, include_inferred=True), result)
+
+
+def technology_rows(matches: list[TechMatch], result: SectionResult) -> tuple[list[TechMatch], list[dict]]:
+    """``(matches, JSON-able rows with their section)`` for already found matches."""
     rows = []
     for m in matches:
         d = m.to_dict()
@@ -485,6 +491,48 @@ def parse_extra_technologies(text: str) -> dict[str, list[str]]:
             if name.strip():
                 extra.setdefault(category.strip() or "Other", []).append(name.strip())
     return extra
+
+
+def fill_technology_columns(row: dict, matches: list[TechMatch], match_rows: list[dict]) -> None:
+    """technologies, num_technologies, inferred_technologies, tech_<section> and technology_matches."""
+    names = _unique(m.name for m in matches)
+    row["technologies"] = "; ".join(names)
+    row["num_technologies"] = len(names)
+    sources: dict[str, list[str]] = {}
+    for m in matches:
+        if m.match_type == "inferred" and m.inferred_from not in sources.setdefault(m.name, []):
+            sources[m.name].append(m.inferred_from)
+    row["inferred_technologies"] = "; ".join(
+        f"{name} (from {', '.join(froms)})" for name, froms in sources.items()
+    )
+    for key in TECH_SECTION_KEYS:
+        row[f"tech_{key}"] = "; ".join(
+            _unique(r["name"] for r in match_rows if r["section"] == key)
+        )
+    row["technology_matches"] = json.dumps(match_rows, ensure_ascii=False)
+
+
+def drop_internal_projects(
+    project_result: ProjectExtractionResult, text: str, section_text: str
+) -> tuple[ProjectExtractionResult, list[str], list[tuple[int, int]]]:
+    """Remove projects assigned by the training company (``internal_projects.find_internal``).
+
+    Returns the remaining projects, the removed project names and the removed blocks' offsets in ``text``
+    (so technologies written only inside them can be dropped too).
+    """
+    kept, removed, spans = [], [], []
+    for project in project_result.projects:
+        if internal_projects.find_internal(project.name):
+            removed.append(project.name)
+            block = section_text[project.start:project.end]
+            at = text.find(block) if block.strip() else -1
+            if at >= 0:
+                spans.append((at, at + len(block)))
+        else:
+            kept.append(project)
+    if not removed:
+        return project_result, [], []
+    return ProjectExtractionResult(kept, project_result.warnings, project_result.preamble), removed, spans
 
 
 def summarize_projects(pr: ProjectExtractionResult) -> str:
@@ -582,21 +630,7 @@ def process_resume(
                 t0 = time.perf_counter()
                 matches, match_rows = match_technologies(text, result, matcher)
                 row["tech_ms"] = round((time.perf_counter() - t0) * 1000, 3)
-                names = _unique(m.name for m in matches)
-                row["technologies"] = "; ".join(names)
-                row["num_technologies"] = len(names)
-                sources: dict[str, list[str]] = {}
-                for m in matches:
-                    if m.match_type == "inferred" and m.inferred_from not in sources.setdefault(m.name, []):
-                        sources[m.name].append(m.inferred_from)
-                row["inferred_technologies"] = "; ".join(
-                    f"{name} (from {', '.join(froms)})" for name, froms in sources.items()
-                )
-                for key in TECH_SECTION_KEYS:
-                    row[f"tech_{key}"] = "; ".join(
-                        _unique(r["name"] for r in match_rows if r["section"] == key)
-                    )
-                row["technology_matches"] = json.dumps(match_rows, ensure_ascii=False)
+                fill_technology_columns(row, matches, match_rows)
             except Exception as e:
                 row["status"], row["error_stage"] = "partial", "match"
                 row["error"] = f"{type(e).__name__}: {str(e)[:150]}"
@@ -606,6 +640,17 @@ def process_resume(
             try:
                 t0 = time.perf_counter()
                 project_result = extractor.extract(result.get("projects", ""))
+                # Training-company projects are not the candidate's own work: drop them and the technologies
+                # written only inside them (inference is redone so implied skills stay consistent).
+                project_result, internal, spans = drop_internal_projects(
+                    project_result, text, result.get("projects", ""))
+                row["internal_projects"] = "; ".join(internal)
+                if spans and matcher is not None and match_rows:
+                    outside = [m for m in matches if m.match_type != "inferred"
+                               and not any(a <= m.start < b for a, b in spans)]
+                    matches, match_rows = technology_rows(sorted(
+                        outside + matcher.infer(outside), key=lambda m: (m.start, m.match_type == "inferred")), result)
+                    fill_technology_columns(row, matches, match_rows)
                 row["project_ms"] = round((time.perf_counter() - t0) * 1000, 3)
                 row["num_projects"] = len(project_result.projects)
                 row["project_names"] = "; ".join(p.name or "(untitled)" for p in project_result.projects)

@@ -16,6 +16,8 @@ from datetime import datetime, timezone
 import re
 from typing import Iterable, Mapping
 
+from internal_projects import find_internal
+
 LANGUAGE_HINTS = {
     "django": "python", "fastapi": "python", "flask": "python", "pytorch": "python",
     "react": "javascript", "next.js": "javascript", "express.js": "javascript",
@@ -69,13 +71,16 @@ PRACTICE_DESCRIPTION = re.compile(r"\b(?:dsa|data structures and algorithms|comp
 def pre_analysis_exclusion(repo: Mapping) -> str | None:
     """Repositories that are never candidate projects, decided without any request.
 
-    The profile README repository (named exactly like its owner) only holds the profile page.
+    The profile README repository (named exactly like its owner) only holds the profile page, and projects assigned
+    by the training company (``dictionaries/internal_projects.txt``) are not the candidate's own work.
     Forks are handled by repository listing (``skip_forks``) and empty repositories by size.
     """
     owner = (repo.get("owner") or {}).get("login") or str(repo.get("full_name", "")).split("/", 1)[0]
     name = repo.get("name") or str(repo.get("full_name", "")).rsplit("/", 1)[-1]
     if owner and str(name).casefold() == str(owner).casefold():
         return "profile_readme"
+    if find_internal(str(name)):
+        return "internal_training_project"
     return None
 
 

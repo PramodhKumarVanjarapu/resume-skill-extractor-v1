@@ -1,0 +1,43 @@
+Tourism website
+Conference Page
+Podcast Page
+My Projects Page
+Bookstore Page
+Music Page - Buffer
+Food munch
+Ecommerce
+VR Products Store ( VR Website )
+Portfolio
+Todos Application
+Countries List
+Chatbot
+Bookmark Marker
+Wikipedia Search Application
+API Testing Console (Go REST Console)
+Speed Typing Test
+Book Store(Book Search)
+Random Joke - Buffer
+Know Fact About the Number - Buffer
+Word Cloud - Buffer
+Emoji Game
+Blog List
+Cryptocurrency Tracker
+Github Popular Repos
+IPL Dashboard
+Nxt Trendz ( ECommerce Clone - Amazon, Flipkart)
+Jobby App
+Nxt Watch
+Coding-x links till Dynamic Website- reference
+Movies App (Netflix/Amazon Prime Clone) 
+Covid Dashboard 
+Tasty Kitchens (Swiggy/Zomato Clone) 
+Spotify Remix (Spotify Clone)
+Mini Games (Collection of Memory Games) 
+Github Profile Visualizer 
+Book Hub (Goodreads Clone) 
+Nxt Assess
+Quiz Game
+Instagram clone
+Travel trip
+Daily mood tracker
+Rock Paper Scissors Game

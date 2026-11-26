@@ -76,6 +76,19 @@ and no libraries, so a "dsa-visualizer" built with React still counts. Stars,
 commits and contributors are never used. Private, deleted (HTTP 404) or blocked
 repositories are reported as failures and are not cached.
 
+### Training-company projects
+
+`dictionaries/internal_projects.txt` lists projects assigned by the training
+company (one per line; text in brackets is an alternative name). They are not the
+candidate's own work: resume projects with these titles are removed from
+`num_projects`, `project_names`, `projects_json` and ranking, technologies written
+only inside them are removed from `tech_projects` / `technologies`, and the
+removed titles are listed in the `internal_projects` column. GitHub repositories
+with these names are skipped as `internal_training_project`. Matching ignores
+case, punctuation, plural "s", words such as App/Page/Website and a trailing
+description ("Nxt Trendz – E-commerce App | React" matches "Nxt Trendz"), but a
+listed name inside a longer title ("AI Chatbot with RAG") does not match.
+
 The cache (`tech-cache.json`) is saved even when a run is interrupted, and saving
 drops entries from older detection versions and superseded pushes.
 

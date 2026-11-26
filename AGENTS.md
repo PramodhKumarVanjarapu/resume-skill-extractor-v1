@@ -26,7 +26,8 @@ directory.
 | `github_profile.py`, `github_enricher.py`, `analyzer.py` | GitHub-profile discovery and repository technology analysis. |
 | `profile_filter.py`, `filter_panel.py` | DataFrame filtering and Streamlit filter controls. |
 | `xlsx_export.py` | Formatted XLSX export. |
-| `dictionaries/` | Technology master list and alias mapping; edit these rather than hard-coding ordinary technology additions. |
+| `dictionaries/` | Technology master list and alias mapping; edit these rather than hard-coding ordinary technology additions. `internal_projects.txt` lists projects assigned by the training company. |
+| `internal_projects.py` | Matches resume project titles and repository names against `internal_projects.txt`; matches are removed from projects, project technologies and the GitHub stack. |
 | `test_section_detector.py` | Table-driven `unittest` coverage for section detection. |
 | `test_project_extractor.py` | Project splitting on real-world PDF layouts (synthetic text). |
 | `test_technology_inference.py` | Hiring vocabulary coverage, context-sensitive terms, and inferred (`implies`) skills. |
@@ -49,7 +50,7 @@ exports additionally use the packages listed in `requirements.txt`.
 Run the tests from the repository root:
 
 ```powershell
-python -m unittest test_section_detector test_project_extractor test_technology_inference test_candidate_ranker test_csv_export test_evidence_features test_github_api_scan test_repository_filter test_repository_analysis
+python -m unittest test_section_detector test_project_extractor test_technology_inference test_candidate_ranker test_csv_export test_evidence_features test_github_api_scan test_repository_filter test_repository_analysis test_internal_projects
 python test_section_detector.py   # section-detector report with precision/recall and timing
 ```
 
