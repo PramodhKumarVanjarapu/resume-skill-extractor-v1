@@ -6,6 +6,12 @@ Public API
 ``TechnologyMatcher.extract(text)``   one entry per technology (deduplicated)
 ``TechnologyMatcher.extract_names(text)``  just the canonical names
 
+All three take ``include_inferred=True`` to also report skills implied by the
+master dictionary's ``implies`` map ("PyTorch" -> "Deep Learning" ->
+"Machine Learning"). Inferred matches have ``match_type="inferred"``, name the
+written technology in ``inferred_from`` and reuse its offsets/evidence; they
+are never added for a skill the text already states.
+
 Each result is a :class:`TechMatch` carrying the canonical name, category, the
 text exactly as written, character offsets, and the *evidence sentence*.
 
@@ -107,6 +113,9 @@ class TechDictionary:
     surfaces: Mapping[str, SurfaceInfo]  # normalised surface -> info
     master: Mapping[str, Any]
     aliases: Mapping[str, str]
+    # canonical name -> skills it implies, transitively closed and in a stable
+    # order ("PyTorch" -> ("Deep Learning", "Machine Learning"))
+    implies: Mapping[str, tuple[str, ...]] = field(default_factory=dict)
 
     def extended(
         self,
@@ -122,6 +131,7 @@ class TechDictionary:
         master = {
             "categories": {c: list(n) for c, n in self.master["categories"].items()},
             "ambiguous_surfaces": list(self.master.get("ambiguous_surfaces", [])),
+            "implies": {k: list(v) for k, v in self.master.get("implies", {}).items()},
         }
         known = set(self.categories)
         for category, names in (extra_technologies or {}).items():
@@ -190,7 +200,51 @@ def build_dictionary(master: Mapping[str, Any], aliases: Mapping[str, str]) -> T
             raise DictionaryError(f"ambiguous surface {exact!r} matches no technology or alias")
         surfaces[key] = replace(info, exact=exact)
 
-    return TechDictionary(name_to_category, surfaces, dict(master), dict(aliases))
+    implies = _close_implications(master.get("implies", {}), name_to_category)
+    return TechDictionary(name_to_category, surfaces, dict(master), dict(aliases), implies)
+
+
+def _close_implications(
+    raw: Any, known: Mapping[str, str]
+) -> dict[str, tuple[str, ...]]:
+    """Validate the master's ``implies`` map and follow chains transitively.
+
+    Raises DictionaryError for unknown names, self-implication and cycles
+    (a cycle would make every member imply itself).
+    """
+    if not isinstance(raw, Mapping):
+        raise DictionaryError("'implies' must be an object of technology -> [implied technologies]")
+    direct: dict[str, list[str]] = {}
+    for source, targets in raw.items():
+        if source not in known:
+            raise DictionaryError(f"'implies' source {source!r} is not a known technology")
+        if not isinstance(targets, (list, tuple)):
+            raise DictionaryError(f"'implies' entry for {source!r} must be a list")
+        for target in targets:
+            if target not in known:
+                raise DictionaryError(f"{source!r} implies unknown technology {target!r}")
+            if target == source:
+                raise DictionaryError(f"{source!r} implies itself")
+        direct[source] = list(dict.fromkeys(targets))
+
+    closed: dict[str, tuple[str, ...]] = {}
+
+    def visit(name: str, path: tuple[str, ...]) -> tuple[str, ...]:
+        if name in closed:
+            return closed[name]
+        if name in path:
+            cycle = " -> ".join(path[path.index(name):] + (name,))
+            raise DictionaryError(f"'implies' cycle: {cycle}")
+        out: list[str] = []
+        for target in direct.get(name, []):
+            out.append(target)
+            out.extend(visit(target, path + (name,)))
+        closed[name] = tuple(dict.fromkeys(out))
+        return closed[name]
+
+    for source in direct:
+        visit(source, ())
+    return {k: v for k, v in closed.items() if v}
 
 
 @lru_cache(maxsize=16)
@@ -238,10 +292,13 @@ class TechMatch:
     evidence: str              # sentence containing the match (whitespace collapsed)
     evidence_start: int        # offsets of the evidence in the input (before collapsing)
     evidence_end: int
-    match_type: str            # "canonical" | "alias"
+    match_type: str            # "canonical" | "alias" | "inferred"
     reason: str                # human-readable explanation of why it matched
     occurrences: int = 1       # set by extract(): total mentions in the text
     all_evidence: tuple[str, ...] = field(default_factory=tuple)  # set by extract()
+    # "inferred" matches only: the technology actually written in the text
+    # (matched_text/offsets/evidence then point at that mention)
+    inferred_from: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         d = asdict(self)
@@ -370,7 +427,9 @@ def resolve_overlaps(items: Iterable[Any]) -> list[Any]:
 # Sentence / evidence location (stage 6)
 # --------------------------------------------------------------------------- #
 
-_BULLET_PREFIX = re.compile(r"^\s*(?:[•●▪■◦·►▸➢✓✔*\-–—]|\d{1,2}[.)]|\(\d{1,2}\))\s+")
+_BULLET_PREFIX = re.compile(
+    r"^\s*(?:[•●▪■◦·►▸➢✓✔*\-–—]\s+|[‣⁃\x80-\x9f-�]\s*|\d{1,2}[.)]\s+|\(\d{1,2}\)\s+)"
+)
 _SENT_END = re.compile(r"(?P<end>[.!?]+[\"')\]]*)\s+(?=[A-Z0-9\"'(\[])")
 _DOTTED_ABBREV = re.compile(r"^(?:[a-z]\.)+[a-z]$")
 _ABBREVIATIONS = frozenset(
@@ -505,7 +564,7 @@ _TRIGGERS = frozenset(
 _FOLLOW_WORDS = frozenset(
     "language languages programming lang framework developer developers backend library "
     "skills skill expertise proficiency scripting script scripts tool tools engineer engineers "
-    "programmer programmers certified".split()
+    "programmer programmers certified model models architecture architectures pipeline pipelines".split()
 )
 _SEASON_AFTER = re.compile(
     r"^\s*(?:'?\d{2,4}\b|semester|term|quarter|break|season|intake|batch|session|cohort|internship)", re.I
@@ -546,7 +605,7 @@ def _judge_ambiguous(
 
 
 # "SAP and Oracle", "Go / Rust": only list connectors between two terms.
-_LIST_CONNECTOR = re.compile(r"^\s*(?:[,;/&|]|\band\b|\bor\b|,\s*and\b|,\s*or\b)\s*$", re.IGNORECASE)
+_LIST_CONNECTOR = re.compile(r"^\s*(?:[,;/&|·•+]|\band\b|\bor\b|,\s*and\b|,\s*or\b)\s*$", re.IGNORECASE)
 
 
 # --------------------------------------------------------------------------- #
@@ -657,11 +716,50 @@ class TechnologyMatcher:
         return self.dictionary.categories.get(name)
 
     # ------------------------------------------------------------------ #
-    def find_all(self, text: str) -> list[TechMatch]:
+    def find_all(self, text: str, include_inferred: bool = False) -> list[TechMatch]:
         """Every technology mention in ``text``, ordered by position.
 
+        With ``include_inferred=True`` the result also contains skills implied
+        by the dictionary's ``implies`` map (see :meth:`infer`).
         Raises TypeError for non-string input; empty text returns ``[]``.
         """
+        matches = self._find_direct(text)
+        if include_inferred and matches:
+            matches = sorted(matches + self.infer(matches), key=lambda m: (m.start, m.match_type == "inferred"))
+        return matches
+
+    def infer(self, matches: Sequence[TechMatch]) -> list[TechMatch]:
+        """Skills implied by ``matches`` that the text never states directly.
+
+        One inferred match per implying mention (so section attribution works),
+        sharing that mention's offsets and evidence; ``match_type`` is
+        ``"inferred"`` and ``inferred_from`` names the written technology.
+        """
+        direct = {m.name for m in matches if m.match_type != "inferred"}
+        out: list[TechMatch] = []
+        seen: set[tuple[str, int]] = set()
+        for m in matches:
+            if m.match_type == "inferred":
+                continue
+            for name in self.dictionary.implies.get(m.name, ()):
+                if name in direct or (name, m.start) in seen:
+                    continue
+                seen.add((name, m.start))
+                out.append(
+                    replace(
+                        m,
+                        name=name,
+                        category=self.dictionary.categories[name],
+                        match_type="inferred",
+                        reason=f"inferred from {m.name}",
+                        occurrences=1,
+                        all_evidence=(m.evidence,),
+                        inferred_from=m.name,
+                    )
+                )
+        return out
+
+    def _find_direct(self, text: str) -> list[TechMatch]:
         if not isinstance(text, str):
             raise TypeError(f"text must be str, got {type(text).__name__}")
         if not text.strip():
@@ -744,7 +842,7 @@ class TechnologyMatcher:
             )
         return results
 
-    def extract(self, text: str, unique: bool = True) -> list[TechMatch]:
+    def extract(self, text: str, unique: bool = True, include_inferred: bool = False) -> list[TechMatch]:
         """Technologies found in ``text``.
 
         With ``unique=True`` (default) each technology appears once, in order of
@@ -752,7 +850,7 @@ class TechnologyMatcher:
         ``occurrences`` counts all mentions and ``all_evidence`` lists the
         distinct evidence sentences. With ``unique=False`` this is ``find_all``.
         """
-        matches = self.find_all(text)
+        matches = self.find_all(text, include_inferred=include_inferred)
         if not unique:
             return matches
         counts = Counter(m.name for m in matches)
@@ -768,9 +866,9 @@ class TechnologyMatcher:
             for name, m in first.items()
         ]
 
-    def extract_names(self, text: str) -> list[str]:
+    def extract_names(self, text: str, include_inferred: bool = False) -> list[str]:
         """Unique canonical names in order of first mention."""
-        return [m.name for m in self.extract(text)]
+        return [m.name for m in self.extract(text, include_inferred=include_inferred)]
 
     # ------------------------------------------------------------------ #
     def _candidates(self, text: str) -> list[_Cand]:

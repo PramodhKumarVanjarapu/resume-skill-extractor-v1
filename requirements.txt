@@ -11,8 +11,8 @@ pypdf>=4.0              # also used by resume.py to read PDF hyperlinks
 python-docx>=1.0
 xlsxwriter>=3.1        # formatted output.xlsx download (the CSV download works without it)
 
-# --- GitHub columns (app/github_enricher.py) ---
-# Also needs the `git` command on PATH and network access to github.com / api.github.com.
+# --- GitHub columns (github_enricher.py) ---
+# Both scan methods need network access. Clone mode also needs `git` on PATH.
 # python-dotenv>=1.0    # optional: read GITHUB_TOKEN from a .env file
 
 # --- optional ---

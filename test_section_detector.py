@@ -1,8 +1,8 @@
 """Tests for section_detector.py.
 
-Run as unit tests:   python -m unittest tests.test_section_detector -v
-                     (or ``pytest tests/test_section_detector.py``)
-Run as a report:     python tests/test_section_detector.py
+Run as unit tests:   python -m unittest test_section_detector -v
+                     (or ``pytest test_section_detector.py``)
+Run as a report:     python test_section_detector.py   (add --unittest for unittest mode)
                      -> per-case Input / Expected / Actual / PASS-FAIL,
                         section-level precision/recall/F1 and timing.
 
@@ -19,8 +19,10 @@ import time
 import unittest
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT / "app"))
+ROOT = Path(__file__).resolve().parent          # modules live at the repository root
+sys.path.insert(0, str(ROOT))
+# Optional real-looking sample (not committed: resumes contain personal data).
+SAMPLE = ROOT / "sample_resumes" / "sample_resume.txt"
 
 from section_detector import SectionDetector, SectionResult  # noqa: E402
 
@@ -282,6 +284,77 @@ CASES: list[dict] = [
         "input": "SKILLS\nPython\nProjects that I have worked on are listed below\nJava",
         "expected": {"skills": "Python\nProjects that I have worked on are listed below\nJava"},
     },
+    {
+        "id": "wrapped_word_is_not_heading",
+        "desc": "A heading word alone on a line because a bullet wrapped stays content",
+        "input": "PROJECTS\nPortfolio Site\n- Added a custom cursor for a polished user\nexperience\n"
+                 "Shop App\n- Built with React\nEDUCATION\nB.E. ECE",
+        "expected": {
+            "projects": "Portfolio Site\n- Added a custom cursor for a polished user\nexperience\n"
+                        "Shop App\n- Built with React",
+            "education": "B.E. ECE",
+        },
+    },
+    {
+        "id": "capitalised_heading_after_unpunctuated_line",
+        "desc": "A capitalised heading right under content is still a heading",
+        "input": "SKILLS\nPython, Java\nPROJECTS\nBlog app",
+        "expected": {"skills": "Python, Java", "projects": "Blog app"},
+    },
+    {
+        "id": "lowercase_style_without_blank_lines",
+        "desc": "Resume styled with lowercase headings keeps them even directly under content",
+        "input": "jane@mail.com\nskills\npython, java\nprojects\nblog app",
+        "expected": {"skills": "python, java", "projects": "blog app"},
+    },
+    {
+        "id": "compound_heading_projects_wins",
+        "desc": "Compound heading containing Projects is the projects section",
+        "input": "SKILLS\nPython\nPROJECTS & EXPERIENCE\nApp One\nEDUCATION\nB.E.",
+        "expected": {"skills": "Python", "projects": "App One", "education": "B.E."},
+    },
+    {
+        "id": "compound_heading_first_part",
+        "desc": "Certifications & Achievements ends the projects section",
+        "input": "PROJECTS\nApp One\nCERTIFICATIONS & ACHIEVEMENTS\nAWS CP",
+        "expected": {"projects": "App One", "certifications": "AWS CP"},
+    },
+    {
+        "id": "compound_heading_needs_known_parts",
+        "desc": "A sentence with 'and' is not a compound heading",
+        "input": "SKILLS\nExperience in Python and Java",
+        "expected": {"skills": "Experience in Python and Java"},
+    },
+    {
+        "id": "letter_spaced_multiword",
+        "desc": "Letter-spaced multi-word headings",
+        "input": "P R O F E S S I O N A L S U M M A R Y\nDev\nT E C H N I C A L S K I L L S\nPython",
+        "expected": {"summary": "Dev", "skills": "Python"},
+    },
+    {
+        "id": "two_column_gap_headings",
+        "desc": "Heading flush left with content after a wide gap (used 2+ times)",
+        "input": "Summary          Final year student\n\nSkills           Java, SQL\nProjects         Shop App",
+        "expected": {"summary": "Final year student", "skills": "Java, SQL", "projects": "Shop App"},
+    },
+    {
+        "id": "single_gap_line_is_content",
+        "desc": "One 'Experience    3 years' line is content, not a heading",
+        "input": "SKILLS\nJava\nExperience     3 years at X",
+        "expected": {"skills": "Java\nExperience     3 years at X"},
+    },
+    {
+        "id": "inline_project_label_in_job",
+        "desc": "'Project: X' inside an experience entry is not a projects heading",
+        "input": "EXPERIENCE\nDev at X\nProject: CocoPlus migration\nPROJECTS\nShop App",
+        "expected": {"experience": "Dev at X\nProject: CocoPlus migration", "projects": "Shop App"},
+    },
+    {
+        "id": "coding_profiles_boundary",
+        "desc": "Coding profile / profile summary headings",
+        "input": "PROFILE SUMMARY\nDev\nPROJECTS\nApp\nCODING PROFILES\nLeetCode 300",
+        "expected": {"summary": "Dev", "projects": "App"},
+    },
 ]
 
 
@@ -395,9 +468,10 @@ class TestConfigurationAndInvalidInput(unittest.TestCase):
             self.assertEqual(dict(DETECTOR.detect(SPEC_RESUME)), first)
 
 
+@unittest.skipUnless(SAMPLE.exists(), f"sample resume not present: {SAMPLE}")
 class TestSampleResume(unittest.TestCase):
     def test_sample_resume_end_to_end(self):
-        text = (ROOT / "sample_resumes" / "sample_resume.txt").read_text(encoding="utf-8")
+        text = SAMPLE.read_text(encoding="utf-8")
         r = DETECTOR.detect(text)
         self.assertEqual(
             list(r),
@@ -447,7 +521,7 @@ def report() -> int:
         f"TP={tp} FP={fp} FN={fn}  precision={precision:.3f} recall={recall:.3f} F1={f1:.3f}"
     )
 
-    sample = (ROOT / "sample_resumes" / "sample_resume.txt").read_text(encoding="utf-8")
+    sample = SAMPLE.read_text(encoding="utf-8") if SAMPLE.exists() else SPEC_RESUME
     for label, text in (("1 resume", sample), ("500 resumes concatenated", (sample + "\n") * 500)):
         runs = []
         for _ in range(15):

@@ -2,7 +2,7 @@
 
     streamlit run app.py
 
-Input : phone number + resume link (single, pasted list, or CSV upload)
+Input : phone number + resume link (pasted list or CSV upload)
 Output: output.csv - one row per resume with exactly these columns:
         phone, resume_link, num_projects, project_names, tech_skills,
         tech_projects, tech_experience, tech_internships, tech_certifications,
@@ -13,11 +13,7 @@ Output: output.csv - one row per resume with exactly these columns:
         its repositories - see github_enricher.py; the optional sidebar box
         "Add diagnostic columns" appends status, error, review flags,
         per-project technologies, GitHub status/notes and warnings.)
-        Below the table, a live "Filter profiles" panel narrows the profiles
-        (technologies, counts, phone lists from Excel ...) and downloads exactly
-        the filtered rows; a second panel filters a CSV / Excel file saved earlier.
-        The on-screen inspector always shows the full detail: extracted text,
-        detected sections, technology matches and projects with evidence.
+        Results can be downloaded as CSV or formatted XLSX.
 
 Technology matching runs on the whole extracted text; each match is then
 attributed to a section by its character offset. Project extraction runs on
@@ -30,6 +26,7 @@ Not supported: scanned/image PDFs (no OCR), legacy .doc, HTML pages.
 
 from __future__ import annotations
 
+import csv
 import io
 import json
 import os
@@ -38,6 +35,7 @@ import sys
 import time
 import zipfile
 import threading
+from collections.abc import Mapping
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 from concurrent.futures.process import BrokenProcessPool
 from pathlib import Path
@@ -46,14 +44,17 @@ from urllib.parse import parse_qs, urlparse
 
 import pandas as pd
 import requests
+import candidate_ranker
+import experience_extractor
+import project_repo_matcher
 
 sys.path.insert(0, str(Path(__file__).resolve().parent / "app"))
 
-# Every module this file imports. A missing one used to surface as "No module named 'filter_panel'"; say which files
+# Every module this file imports. A missing one gets a clear startup error.
 # are missing and where they belong instead.
 REQUIRED_MODULES = (
     "section_detector", "technology_matcher", "project_extractor", "github_profile", "github_enricher", "analyzer",
-    "resume", "profile_filter", "filter_panel", "xlsx_export", "pdf_parse",
+    "resume", "xlsx_export", "pdf_parse", "candidate_ranker", "experience_extractor", "project_repo_matcher",
 )
 _here = Path(__file__).resolve().parent
 _missing = [f"{name}.py" for name in REQUIRED_MODULES
@@ -64,10 +65,8 @@ if _missing:
         + f". Put them in the folder '{_here / 'app'}' (next to the other modules) and run again. "
           "The latest resume_extractor.zip contains all of them."
     )
-import filter_panel  # noqa: E402
 import github_enricher  # noqa: E402
 import pdf_parse  # noqa: E402
-import profile_filter  # noqa: E402
 import xlsx_export  # noqa: E402
 import section_detector  # noqa: E402
 import project_extractor  # noqa: E402
@@ -102,7 +101,14 @@ BASE_COLUMNS = [
 # "other" = headings we recognise but do not export (Hobbies, Languages, ...).
 TECH_SECTION_KEYS = SECTION_KEYS + ["preamble", "other"]
 TECH_COLUMNS = [f"tech_{k}" for k in TECH_SECTION_KEYS]
-PROJECT_COLUMNS = ["projects_summary", "unrecognized_technologies"]
+PROJECT_COLUMNS = ["projects_summary", "unrecognized_technologies", "inferred_technologies"]
+EVIDENCE_COLUMNS = [
+    "github_evidence_details", "verified_project_repositories", "project_repo_match_confidence",
+    "experience_evidence_details", "internship_evidence_details", "recent_repositories_count",
+    "active_repositories_count", "older_repositories_count", "inactive_repositories_count",
+    "unknown_repositories_count", "most_recent_github_activity", "repository_activity_details",
+    "evidence_review_flags",
+]
 # github_profile, repos_count, github_tech_stack, project_categories, github_status, github_notes
 GITHUB_COLUMNS = github_enricher.GITHUB_COLUMNS
 # how sure we are that github_profile is the candidate's own account, and every candidate with its evidence
@@ -112,7 +118,7 @@ TAIL_COLUMNS = [
     "download_s", "parse_s", "detect_ms", "tech_ms", "project_ms",
 ]
 ALL_COLUMNS = (BASE_COLUMNS + SECTION_KEYS + TECH_COLUMNS + PROJECT_COLUMNS + GITHUB_COLUMNS
-               + PROFILE_SEARCH_COLUMNS + TAIL_COLUMNS)
+               + PROFILE_SEARCH_COLUMNS + TAIL_COLUMNS + EVIDENCE_COLUMNS)
 
 # The columns of the downloadable output.csv, in this order.
 OUTPUT_COLUMNS = [
@@ -124,7 +130,8 @@ OUTPUT_COLUMNS = [
 # Optional extras (sidebar checkbox) that explain failures and uncertainty.
 DIAGNOSTIC_COLUMNS = [
     "status", "error_stage", "error", "projects_needs_review", "projects_summary",
-    "unrecognized_technologies", "github_confidence", "github_candidates", "github_status", "github_notes", "warnings",
+    "unrecognized_technologies", "inferred_technologies", "github_confidence", "github_candidates", "github_status",
+    "github_notes", "warnings",
 ]
 
 
@@ -444,8 +451,12 @@ def section_for_offset(result: SectionResult, pos: int) -> str:
 def match_technologies(
     text: str, result: SectionResult, matcher: TechnologyMatcher
 ) -> tuple[list[TechMatch], list[dict]]:
-    """All technology mentions in ``text`` plus flat, JSON-able rows (with section)."""
-    matches = matcher.find_all(text)
+    """All technology mentions in ``text`` plus flat, JSON-able rows (with section).
+
+    Includes skills implied by a written technology (``match_type="inferred"``,
+    e.g. "Deep Learning" from "PyTorch") so skill columns and filters see them.
+    """
+    matches = matcher.find_all(text, include_inferred=True)
     rows = []
     for m in matches:
         d = m.to_dict()
@@ -574,6 +585,13 @@ def process_resume(
                 names = _unique(m.name for m in matches)
                 row["technologies"] = "; ".join(names)
                 row["num_technologies"] = len(names)
+                sources: dict[str, list[str]] = {}
+                for m in matches:
+                    if m.match_type == "inferred" and m.inferred_from not in sources.setdefault(m.name, []):
+                        sources[m.name].append(m.inferred_from)
+                row["inferred_technologies"] = "; ".join(
+                    f"{name} (from {', '.join(froms)})" for name, froms in sources.items()
+                )
                 for key in TECH_SECTION_KEYS:
                     row[f"tech_{key}"] = "; ".join(
                         _unique(r["name"] for r in match_rows if r["section"] == key)
@@ -603,6 +621,18 @@ def process_resume(
                 row["status"], row["error_stage"] = "partial", "projects"
                 row["error"] = f"{type(e).__name__}: {str(e)[:150]}"
                 project_result = None
+        if matcher is not None:
+            for section_key, column in (("experience", "experience_evidence_details"),
+                                        ("internships", "internship_evidence_details")):
+                try:
+                    detail = experience_extractor.extract_experiences(result.get(section_key, ""), matcher, section_key)
+                    row[column] = json.dumps(detail, ensure_ascii=False)
+                    if detail["warnings"]:
+                        row["evidence_review_flags"] = "; ".join(filter(None, [row["evidence_review_flags"],
+                                                      *detail["warnings"]]))
+                except Exception as exc:
+                    row["evidence_review_flags"] = "; ".join(filter(None, [row["evidence_review_flags"],
+                                                  f"{section_key} attribution unavailable: {exc}"]))
     except ResumeError as e:
         row["error_stage"], row["error"] = e.stage, str(e)
     except Exception as e:  # defensive: one bad file must not kill the batch
@@ -638,13 +668,20 @@ def run_batch(
 
 def run_github(
     items: list[Processed],
-    token: str | None = None,
+    token: github_enricher.GitHubAuthorization = None,
     skip_forks: bool = True,
     progress_cb: Callable[[int, int], None] | None = None,
     max_profiles: int | None = None,
     rate: github_enricher.RateLimit | None = None,
     all_profiles: bool = False,
     max_repos: int | None = github_enricher.MAX_REPOS_PER_ACCOUNT,
+    required_groups: tuple[tuple[str, ...], ...] = (),
+    initial_repo_budget: int | None = 15,
+    exhaustive: bool = False,
+    screening_threshold: float = 60,
+    min_matching_projects: int = 2,
+    *,
+    scan_method: github_enricher.RepositoryScanMethod = "clone",
 ) -> list[Processed]:
     """Fill repos_count, github_tech_stack, project_categories, github_status and github_notes.
 
@@ -658,13 +695,79 @@ def run_github(
     quota are skipped with a clear note instead of failing halfway. Never raises.
     """
     targets = [p for p in items if p.row["status"] in ("ok", "partial")]
+    needs_more_evidence = None
+    if required_groups and not exhaustive:
+        try:
+            rank_matcher = TechnologyMatcher()
+        except (DictionaryError, EngineUnavailable):
+            rank_matcher = None
+    else:
+        rank_matcher = None
+    if rank_matcher is not None:
+        rank_requirements = tuple(candidate_ranker.Requirement(tuple(group)) for group in required_groups)
+        rows_by_profile: dict[str, list[dict]] = {}
+        for item in targets:
+            for profile in item.profiles:
+                rows_by_profile.setdefault(profile.casefold(), []).append(item.row)
+
+        def needs_more_evidence(person: dict, analysed_repos: list[dict]) -> bool:
+            stack = "; ".join(dict.fromkeys(
+                technology for repo in analysed_repos if not repo.get("error")
+                for technology in repo.get("technologies", [])
+            ))
+            linked_rows = [row for profile in person["profiles"]
+                           for row in rows_by_profile.get(profile.casefold(), [])]
+            for row in linked_rows:
+                scored = candidate_ranker.score_candidate(
+                    {**row, "github_tech_stack": stack, "github_status": "done"},
+                    rank_requirements, rank_matcher, threshold=screening_threshold,
+                    min_matching_projects=min_matching_projects,
+                )
+                if scored["project_threshold_met"] is not True:
+                    continue  # Repository scans cannot add resume projects.
+                has_experience = bool(scored["experience_matched_technologies"])
+                best_priority = "P1" if has_experience else "P2"
+                if not scored["technology_threshold_met"] or scored["potential_priority"] != best_priority:
+                    return True
+            return False
+
     infos = github_enricher.analyze_profiles(
         [p.profiles for p in targets], token, skip_forks, progress_cb, max_profiles=max_profiles, rate=rate,
-        all_profiles=all_profiles, max_repos=max_repos,
+        all_profiles=all_profiles, max_repos=max_repos, required_groups=required_groups,
+        initial_repo_budget=initial_repo_budget, exhaustive=exhaustive,
+        needs_more_evidence=needs_more_evidence, scan_method=scan_method,
     )
     for p, info in zip(targets, infos):
         p.github = info
         p.row.update(info.columns())
+        activity = github_enricher.activity_summary(info.repositories)
+        p.row["recent_repositories_count"] = activity["recent_repositories_count"]
+        p.row["active_repositories_count"] = activity["active_repositories_count"]
+        p.row["older_repositories_count"] = activity["older_repositories_count"]
+        p.row["inactive_repositories_count"] = activity["inactive_repositories_count"]
+        p.row["unknown_repositories_count"] = activity["unknown_repositories_count"]
+        p.row["most_recent_github_activity"] = activity["most_recent_github_activity"]
+        p.row["repository_activity_details"] = json.dumps(activity["repositories"], ensure_ascii=False)
+        evidence = []
+        for repo in info.repositories:
+            if repo.get("excluded"):
+                continue  # practice, tutorial, duplicate or code-less repositories are not evidence
+            recorded = repo.get("technology_evidence")
+            if recorded is None:
+                recorded = [{"technology": tech, "type": "legacy_detection", "path": "",
+                             "strength": "unspecified"} for tech in repo.get("technologies", [])]
+            for item in recorded:
+                evidence.append({**item, "repository": repo.get("repository", ""), "repository_url": repo.get("url", ""),
+                                 "cache_refreshed_at": repo.get("cache_refreshed_at")})
+        p.row["github_evidence_details"] = json.dumps(evidence, ensure_ascii=False)
+        if p.project_result is not None:
+            matches = project_repo_matcher.match_projects(p.project_result["projects"], info.repositories)
+            p.row["verified_project_repositories"] = json.dumps(matches, ensure_ascii=False)
+            p.row["project_repo_match_confidence"] = "; ".join(
+                f"{m['project_name']}: {m['confidence']}" for m in matches)
+            if any(m["requires_review"] for m in matches):
+                p.row["evidence_review_flags"] = "; ".join(filter(None, [p.row["evidence_review_flags"],
+                                              "Ambiguous project-repository match"]))
     return items
 
 
@@ -690,11 +793,12 @@ def profile_confidence_message(items: list[Processed]) -> tuple[str, str] | None
 
 def github_limits_message(items: list[Processed], cap: int | None) -> tuple[str, str] | None:
     """Tell the user how many accounts hit the per-account repository cap (so the stack is from the newest repos only)."""
-    capped = [p for p in items if p.github is not None and any("most recently updated were analysed" in n for n in p.github.notes)]
+    capped = [p for p in items if p.github is not None and any("most recently updated were listed" in n for n in p.github.notes)]
     if not capped or cap is None:
         return None
     return ("caption", f"GitHub: {len(capped)} account(s) have more than {cap} repositories, so only the {cap} most recently "
-                       f"updated were analysed (raise 'Max repositories analysed per account' in the sidebar to change this).")
+                       "updated were listed for prioritization (raise 'Maximum repositories listed per account' "
+                       "in the sidebar to change this).")
 
 
 def parse_blocked_accounts(text: str) -> tuple[str, ...]:
@@ -727,8 +831,11 @@ def github_summary_messages(
         out.append(("warning", f"GitHub: {summary['skipped_rate_limit']} resume(s) were SKIPPED because the GitHub API "
                                f"request limit was too low for the whole batch.{when} {fix}"))
     if summary.get("rate_limited"):
-        out.append(("warning", f"GitHub: {summary['rate_limited']} resume(s) FAILED because the API request limit ran out "
-                               f"during the run. Add a GitHub token, or re-run these rows later."))
+        out.append(("warning", f"The GitHub API request limit interrupted profile listing for "
+                               f"{summary['rate_limited']} resume(s)."))
+    if summary.get("repository_rate_limited"):
+        out.append(("warning", f"The GitHub API request limit interrupted repository scans for "
+                               f"{summary['repository_rate_limited']} resume(s). Results may be incomplete."))
     if summary.get("bad_token"):
         out.append(("error", f"GitHub: {summary['bad_token']} resume(s) failed because the GitHub token is invalid or expired."))
     if summary.get("organisation"):
@@ -754,8 +861,22 @@ def to_dataframe(items: list[Processed], include_raw_text: bool = False) -> pd.D
 
 
 def to_csv_bytes(df: pd.DataFrame) -> bytes:
-    """Every column of ``df`` as UTF-8 with BOM (so Excel opens non-ASCII text correctly)."""
-    return df.to_csv(index=False).encode("utf-8-sig")
+    """RFC 4180-compatible UTF-8 CSV, with a BOM for spreadsheet importers.
+
+    CSV intentionally has no widths, wrapping, styles, or cell types. Values
+    containing commas, quotes, or line breaks are quoted so Google Sheets and
+    Excel import them as one cell. Use the XLSX download when visual formatting
+    or text-typed phone numbers is required.
+    """
+    return df.to_csv(
+        index=False,
+        na_rep="",
+        # Quote every field. This is valid RFC 4180 and makes the comma
+        # delimiter unambiguous to spreadsheet importers with locale-specific
+        # number/list separators.
+        quoting=csv.QUOTE_ALL,
+        lineterminator="\r\n",
+    ).encode("utf-8-sig")
 
 
 def output_columns(df: pd.DataFrame, include_diagnostics: bool = False) -> list[str]:
@@ -765,6 +886,9 @@ def output_columns(df: pd.DataFrame, include_diagnostics: bool = False) -> list[
         cols += DIAGNOSTIC_COLUMNS
     if "raw_text" in df.columns:          # only present when the sidebar option asked for it
         cols.append("raw_text")
+    cols += [name for name in candidate_ranker.RANKING_COLUMNS if name in df.columns]
+    cols += [name for name in EVIDENCE_COLUMNS if name in df.columns]
+    cols += [name for name in github_enricher.GITHUB_COLUMNS if name not in cols and name in df.columns]
     return cols
 
 
@@ -801,56 +925,143 @@ def output_xlsx_bytes(df: pd.DataFrame, include_diagnostics: bool = False) -> by
     return xlsx_export.dataframe_to_xlsx(df, output_columns(df, include_diagnostics))
 
 
-def filter_alias_resolver(st):
-    """Resolver that lets the technology columns of the filter understand aliases (nodejs = Node.js); built once per
-    session. None if the dictionary cannot be loaded (the filter then simply matches the typed words)."""
-    if "flt_alias_resolver" not in st.session_state:
-        try:
-            st.session_state["flt_alias_resolver"] = profile_filter.alias_resolver(TechnologyMatcher())
-        except (DictionaryError, EngineUnavailable):
-            st.session_state["flt_alias_resolver"] = None
-    return st.session_state["flt_alias_resolver"]
-
-
-def render_profile_filter(st, df: pd.DataFrame, csv_cols: list[str], excel_phone: bool) -> None:
-    """Live filter panel for the profiles of this run: it filters exactly the columns of output.csv."""
+def render_candidate_ranking(st, df: pd.DataFrame, include_diag: bool, excel_phone: bool) -> pd.DataFrame | None:
+    """Collect role requirements and rank cached extraction rows on demand."""
     st.divider()
-    st.subheader("Filter profiles")
-    st.caption("Narrow down the profiles above: results update as you type, and the downloads contain exactly the "
-               "profiles and columns you see here.")
-    table = df[csv_cols].apply(lambda column: column.map(profile_filter.cell_text))      # all text: nothing is type-guessed
-    filter_panel.render(
-        st, table, scope="results", alias_resolver=filter_alias_resolver(st),
-        csv_builder=lambda frame, cols: table_csv_bytes(frame, cols, excel_phone),
-    )
-
-
-def render_file_filter(st, excel_phone: bool) -> None:
-    """Filter a CSV / Excel file saved earlier (for example last week's output.csv) without running anything."""
-    with st.expander("Filter a CSV or Excel file you saved earlier"):
-        upload = st.file_uploader("output.csv or output.xlsx", type=["csv", "xlsx"], key="flt_file_upload")
-        if upload is None:
-            st.caption("Upload a file to filter it with the same panel. Nothing is type-guessed, so phone numbers keep "
-                       "their leading zeros.")
-            return
+    st.subheader("Candidate Ranking & Prioritization")
+    st.caption("Enter one technology or alternatives separated by OR. Only project, professional experience, and "
+               "analysed GitHub technology evidence contributes to ranking.")
+    entries = st.session_state.setdefault("ranking_requirements", [])
+    with st.form("ranking_add_requirement", clear_on_submit=True):
+        a, b = st.columns([5, 1])
+        raw = a.text_input("Technology or alternative group", placeholder="Django OR FastAPI OR Flask")
+        mandatory = b.selectbox("Type", ["Mandatory", "Optional"])
+        add = st.form_submit_button("Add requirement")
+    if add and raw.strip():
         try:
-            table, notes = profile_filter.read_table(upload.getvalue(), upload.name)
+            candidate_ranker.normalize_requirements([(raw, mandatory == "Mandatory")], TechnologyMatcher())
         except ValueError as exc:
             st.error(str(exc))
-            return
-        for note in notes:
-            st.caption(note)
-        st.caption(f"{len(table)} rows, {len(table.columns)} columns")
-        filter_panel.render(
-            st, table, scope="file", alias_resolver=filter_alias_resolver(st),
-            csv_builder=lambda frame, cols: table_csv_bytes(frame, cols, excel_phone),
-            file_stem=f"{Path(upload.name).stem}_filtered",
-        )
+        else:
+            entries.append((raw.strip(), mandatory == "Mandatory"))
+    for index, (raw, required) in enumerate(list(entries)):
+        c1, c2 = st.columns([8, 1])
+        c1.write(f"{'Mandatory' if required else 'Optional'}: {raw}")
+        if c2.button("Remove", key=f"rank_remove_{index}"):
+            entries.pop(index)
+            st.rerun()
+    threshold = st.slider("Minimum Technology Match (%)", 0, 100, 60)
+    min_projects = st.slider("Minimum Matching Projects", 0, 20, 2)
+    st.caption("Only distinct resume projects with a mandatory technology count. Project eligibility is unverified "
+               "when individual project extraction is unavailable.")
+    w1, w2, w3 = st.columns(3)
+    weights = {
+        "github": w1.number_input("GitHub evidence weight", min_value=0, value=50),
+        "project": w2.number_input("Project evidence weight", min_value=0, value=30),
+        "experience": w3.number_input("Experience evidence weight", min_value=0, value=20),
+    }
+    if st.button("Rank Candidates", type="primary"):
+        if not entries:
+            st.info("Add a requirement before ranking.")
+        elif sum(weights.values()) == 0:
+            st.error("At least one evidence weight must be positive.")
+        else:
+            st.session_state["ranking_config"] = (list(entries), threshold, dict(weights), min_projects)
+    config = st.session_state.get("ranking_config")
+    if config is None:
+        return None
+    try:
+        matcher = TechnologyMatcher()
+        requirements = candidate_ranker.normalize_requirements(config[0], matcher)
+        ranked = pd.DataFrame(candidate_ranker.rank_candidates(
+            df.to_dict("records"), requirements, matcher, config[2], config[1], config[3] if len(config) > 3 else 2,
+        ))
+    except (ValueError, DictionaryError, EngineUnavailable) as exc:
+        st.error(f"Could not rank candidates: {exc}")
+        return None
+    counts = ranked["priority"].value_counts()
+    metrics = st.columns(6)
+    for column, (label, count) in zip(metrics, [
+        ("Total", len(ranked)), ("Meeting thresholds", int(ranked["shortlisting_eligible"].sum())),
+        *[(p, int(counts.get(p, 0))) for p in ("P1", "P2", "P3", "Unclassified")],
+    ]):
+        column.metric(label, count)
+    show_all = st.checkbox("Show all candidates, including below threshold")
+    selected = st.multiselect("Priority", ["P1", "P2", "P3", "Unclassified", "Pending Analysis", "Below Threshold"],
+                              default=["P1", "P2", "P3", "Unclassified", "Pending Analysis", "Below Threshold"])
+    p1_only = st.checkbox("P1 candidates only")
+    min_match = st.slider("Filter minimum technology match (%)", 0, 100, 0)
+    min_evidence = st.slider("Filter minimum evidence score", 0, 100, 0)
+    technology = st.text_input("Filter by matched technology")
+    filtered = ranked[ranked["priority"].isin(["P1"] if p1_only else selected)].copy()
+    if not show_all:
+        filtered = filtered[~filtered["priority"].isin(["Below Threshold", "Pending Analysis"])]
+    filtered = filtered[(filtered["technology_match_percentage"] >= min_match)
+                        & (filtered["evidence_score"] >= min_evidence)]
+    if technology.strip():
+        canonical = candidate_ranker._canonical(technology, matcher)
+        if canonical is None:
+            st.warning("Technology is not in the dictionary.")
+            filtered = filtered.iloc[0:0]
+        else:
+            filtered = filtered[filtered.apply(
+                lambda row: canonical in set(candidate_ranker._source_set(
+                    ";".join(str(row[c]) for c in ("github_matched_technologies", "project_matched_technologies",
+                                                   "experience_matched_technologies")), matcher)), axis=1,
+            )]
+    columns = ["phone", "resume_link", *candidate_ranker.RANKING_COLUMNS]
+    st.dataframe(filtered[columns], hide_index=True, use_container_width=True)
+    for index, row in filtered.iterrows():
+        with st.expander(f"Evidence: {row.get('phone') or row.get('resume_link') or index}"):
+            st.write({name: row[name] for name in candidate_ranker.RANKING_COLUMNS})
+            for title, column in (("GitHub technology provenance", "github_evidence_details"),
+                                  ("Project verification", "verified_project_repositories"),
+                                  ("Experience attribution", "experience_evidence_details"),
+                                  ("Internship attribution", "internship_evidence_details"),
+                                  ("Repository activity", "repository_activity_details")):
+                st.markdown(f"**{title}**")
+                try:
+                    detail = json.loads(row.get(column) or "null")
+                except (TypeError, ValueError):
+                    detail = None
+                st.write(detail if detail else "Unavailable")
+            st.caption(f"GitHub evidence quality: {row['github_evidence_quality']}; repository authorship is not inferred.")
+    st.download_button("Download filtered ranking CSV", output_csv_bytes(filtered, include_diag, excel_phone),
+                       file_name="candidate_ranking.csv", mime="text/csv")
+    try:
+        st.download_button("Download filtered ranking XLSX", output_xlsx_bytes(filtered, include_diag),
+                           file_name="candidate_ranking.xlsx",
+                           mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+    except ImportError:
+        pass
+    return ranked
 
 
 # --------------------------------------------------------------------------- #
 # Streamlit UI
 # --------------------------------------------------------------------------- #
+
+def _github_tokens(secrets: Mapping[str, object], manual_token: str) -> dict[str, str]:
+    """Return tokens in priority order, with their configuration sources for logging."""
+    environment_token = os.getenv("GITHUB_TOKEN")
+    try:
+        configured = secrets.get("GITHUB_TOKENS", ())
+        secret_token = secrets.get("GITHUB_TOKEN")
+    except FileNotFoundError:
+        configured, secret_token = (), None
+    configured = configured if isinstance(configured, (list, tuple)) else ()
+    values = (
+        ("the sidebar GitHub token", manual_token),
+        *((f"GITHUB_TOKENS entry #{index}", value) for index, value in enumerate(configured, 1)),
+        ("GITHUB_TOKEN in Streamlit secrets", secret_token),
+        ("the GITHUB_TOKEN environment variable", environment_token),
+    )
+    tokens: dict[str, str] = {}
+    for source, value in values:
+        if isinstance(value, str) and value.strip():
+            tokens.setdefault(value.strip(), source)
+    return tokens
+
 
 def main() -> None:
     import streamlit as st
@@ -862,7 +1073,7 @@ def main() -> None:
         pass
 
     st.set_page_config(page_title="Resume Extractor Tester", layout="wide")
-    st.title("Resume Extractor - test harness")
+    st.title("Resume Shortlisting")
     st.caption(
         "Phone + resume link -> download -> extract text -> section_detector -> technology_matcher -> output.csv. "
         "Supports PDF, DOCX and TXT (no OCR)."
@@ -896,24 +1107,50 @@ def main() -> None:
         st.subheader("GitHub")
         run_gh = st.checkbox(
             "Analyse GitHub repositories", value=True,
-            help="Adds repos_count, github_tech_stack and project_categories. Needs network access and the "
-                 "`git` command; can take minutes for people with many repositories. The profile column is "
-                 "filled either way.",
+            help="Adds repos_count, github_tech_stack and project_categories. The profile column is filled either way.",
+        )
+        scan_method = st.selectbox(
+            "Repository scan method", ("clone", "api"),
+            format_func={"clone": "Git clone", "api": "GitHub API (token)"}.__getitem__,
+            help="Git clone requires Git installed. GitHub API uses a token to fetch only the file tree and "
+                 "selected files. API scans use API quota for repository contents as well as listing.",
+        )
+        github_parallel_requests = st.slider(
+            "Parallel GitHub API requests", min_value=1, max_value=github_enricher.MAX_PARALLEL_GITHUB_REQUESTS,
+            value=github_enricher.DEFAULT_PARALLEL_GITHUB_REQUESTS, disabled=not run_gh,
+            help="Maximum simultaneous GitHub API requests per batch. Applies to repository listing in both modes "
+                 "and file downloads in API mode.",
         )
         gh_token = st.text_input(
-            "GitHub token (optional)", value=os.getenv("GITHUB_TOKEN", ""), type="password",
-            help="Read from GITHUB_TOKEN if set. Without a token GitHub allows 60 API requests per hour.",
+            "GitHub token", type="password",
+            help="You can enter a token here or configure GITHUB_TOKENS in Streamlit secrets. A token is required for "
+                 "API scans and optional for Git clone.",
         )
-        if run_gh and not gh_token.strip():
-            st.warning("No GitHub token: GitHub allows only 60 API requests per hour, so a batch with more than "
-                       "about 55 GitHub profiles can only be analysed in part.")
+        tokens = _github_tokens(st.secrets, gh_token) if run_gh else {}
+        if run_gh and not tokens:
+            if scan_method == "api":
+                st.warning("Enter or configure a GitHub token to scan repositories through the API.")
+            else:
+                st.warning("Without a token, GitHub allows 60 API requests per hour. A batch with more than "
+                           "about 55 GitHub profiles may be analysed in part.")
         skip_forks = st.checkbox("Skip forked repositories", value=True, help="Forks are mostly other people's code.")
         max_repos = int(st.number_input(
-            "Max repositories analysed per account", min_value=10, max_value=500, value=github_enricher.MAX_REPOS_PER_ACCOUNT,
-            step=10, help="Protects against huge accounts: each repository is cloned and scanned. Accounts with more get "
-                          "their most recently updated repositories, and GitHub organisations (google, linkedin, ...) are "
-                          "skipped after one request.",
+            "Maximum repositories listed per account", min_value=10, max_value=500,
+            value=github_enricher.MAX_REPOS_PER_ACCOUNT, step=10,
+            help="GitHub organisations and very large accounts are capped during listing. This limit is separate "
+                 "from the number selected for analysis.",
         ))
+        initial_repo_budget = int(st.number_input(
+            "Initial repositories to analyze per candidate", min_value=1, max_value=500, value=15,
+            help="Cached repositories are reused. Other repositories are prioritized from metadata before scanning.",
+        ))
+        exhaustive_gh = st.checkbox("Analyze all listed repositories", value=False,
+                                    help="Disables the initial scan budget when completeness is required.")
+        relevance_text = st.text_area(
+            "GitHub relevance requirements (optional)", height=75,
+            placeholder="Python\nDjango OR FastAPI OR Flask\nPostgreSQL",
+            help="One mandatory technology or OR group per line. These hints determine the order of repository scans.",
+        )
         blocked_text = st.text_area(
             "GitHub accounts to ignore (one per line)", height=70, placeholder="some-company\nsome-course-org",
             help="Names that should never be taken as a candidate's profile. Well-known organisations "
@@ -931,16 +1168,9 @@ def main() -> None:
         st.caption("Detector, matcher and extractor are rebuilt on every run, so edits to the modules "
                    "or the dictionary JSON files are picked up.")
 
-    tab_single, tab_paste, tab_csv = st.tabs(["Single resume", "Paste list", "Upload CSV"])
-    single_entries: list[tuple[str, str]] = []
+    tab_paste, tab_csv = st.tabs(["Paste list", "Upload CSV"])
     paste_entries: list[tuple[str, str]] = []
     csv_entries: list[tuple[str, str]] = []
-
-    with tab_single:
-        phone = st.text_input("Phone number", key="single_phone")
-        link = st.text_input("Resume link", key="single_link")
-        if link.strip():
-            single_entries = [(phone.strip(), link.strip())]
 
     with tab_paste:
         pasted = st.text_area(
@@ -979,7 +1209,7 @@ def main() -> None:
     # Streamlit cannot tell which tab is open, so use the first tab with input.
     source, entries = next(
         ((name, e) for name, e in (
-            ("Upload CSV", csv_entries), ("Paste list", paste_entries), ("Single resume", single_entries),
+            ("Upload CSV", csv_entries), ("Paste list", paste_entries),
         ) if e),
         ("", []),
     )
@@ -1009,10 +1239,18 @@ def main() -> None:
 
         st.session_state["github_summary"] = None            # never show a previous run's outcome
         if run_gh:
-            if not github_enricher.git_available():
-                st.error("GitHub analysis skipped: the `git` command was not found. Install git, or untick "
-                         "'Analyse GitHub repositories'. GitHub profiles are still listed.")
+            retry_at = st.session_state.get("github_retry_at", 0.0)
+            if scan_method == "api" and not tokens:
+                st.error("GitHub analysis skipped. Enter or configure a token for API scanning.")
+            elif scan_method == "clone" and not github_enricher.git_available():
+                st.error("GitHub analysis skipped. Git clone requires the `git` command. GitHub profiles are still listed.")
+            elif retry_at > time.time():
+                when = time.strftime("%H:%M:%S", time.localtime(retry_at))
+                st.warning(f"GitHub analysis paused until {when} because the API rate limit was reached.")
             elif any(p.profiles for p in items):
+                credentials = github_enricher.GitHubCredentials(
+                    tuple(tokens), token_sources=tokens, max_parallel_requests=github_parallel_requests,
+                )
                 gbar = st.progress(0.0, text="Finding GitHub repositories...")
 
                 def gh_progress(done: int, total: int) -> None:
@@ -1021,35 +1259,54 @@ def main() -> None:
                     else:
                         gbar.progress(0.0, text="Finding GitHub repositories...")
 
-                token = gh_token.strip() or None
-                rate = github_enricher.rate_limit_status(token)       # free call; None if it cannot be read
+                try:
+                    requirement_entries = [(line.strip(), True) for line in relevance_text.splitlines() if line.strip()]
+                    if not requirement_entries:
+                        requirement_entries = list(st.session_state.get("ranking_requirements", []))
+                    repo_requirements = candidate_ranker.normalize_requirements(
+                        requirement_entries, shared or TechnologyMatcher())
+                    required_groups = tuple(req.technologies for req in repo_requirements if req.mandatory)
+                except (ValueError, DictionaryError, EngineUnavailable) as exc:
+                    st.warning(f"GitHub relevance requirements ignored: {exc}")
+                    required_groups = ()
+                rate = github_enricher.rate_limit_status(credentials)
                 budget = None
                 if rate is not None:
                     needed = len({u.lower() for p in items for u in (p.profiles if all_profiles else p.profiles[:1])})
                     budget = rate.budget()
                     if needed > budget:
                         st.warning(
-                            f"GitHub API quota: {rate.remaining} of {rate.limit} requests left"
-                            f"{'' if rate.authenticated else ' (no token)'}, but {needed} distinct profiles need one each. "
-                            f"Only the first {budget} will be analysed now; the rest are marked as skipped (quota resets "
-                            f"at {rate.reset_text()}). Add a GitHub token to analyse them all."
+                            f"The GitHub API has {rate.remaining} of {rate.limit} requests left"
+                            f"{'' if rate.authenticated else ' (no token)'}. Listing the repositories for {needed} "
+                            f"distinct profiles needs at least one request each. Only the first {budget} profiles will "
+                            f"be listed now. The quota resets at {rate.reset_text()}."
                         )
-                run_github(items, token, skip_forks, gh_progress, max_profiles=budget, rate=rate, all_profiles=all_profiles,
-                           max_repos=max_repos)
+                screening_config = st.session_state.get("ranking_config")
+                run_github(items, credentials, skip_forks, gh_progress, max_profiles=budget, rate=rate, all_profiles=all_profiles,
+                           max_repos=max_repos, required_groups=required_groups,
+                           initial_repo_budget=initial_repo_budget, exhaustive=exhaustive_gh, scan_method=scan_method,
+                           screening_threshold=screening_config[1] if screening_config else 60,
+                           min_matching_projects=screening_config[3] if screening_config and len(screening_config) > 3 else 2)
+                st.session_state["github_retry_at"] = max(
+                    credentials.retry_at, rate.reset if rate is not None and rate.remaining == 0 else 0,
+                )
                 st.session_state["github_max_repos"] = max_repos
                 gbar.empty()
+                if credentials.retry_at > time.time():
+                    when = time.strftime("%H:%M:%S", time.localtime(credentials.retry_at))
+                    st.caption(f"GitHub API requests can resume after {when}.")
                 st.session_state["github_summary"] = (
                     github_enricher.summarize(p.github for p in items if p.github is not None), rate,
                 )
             else:
                 st.info("No GitHub profile was found in any resume, so there was nothing to analyse.")
         st.session_state["items"] = items
+        st.session_state.pop("ranking_config", None)
         st.session_state["include_raw"] = include_raw
         st.session_state["elapsed"] = time.perf_counter() - t0
 
     items = st.session_state.get("items")
     if not items:
-        render_file_filter(st, excel_phone)
         return
 
     df = to_dataframe(items, st.session_state.get("include_raw", False))
@@ -1068,10 +1325,23 @@ def main() -> None:
     limits = github_limits_message(items, st.session_state.get("github_max_repos"))
     if limits:
         getattr(st, limits[0])(limits[1])
+    github_infos = [p.github for p in items if p.github is not None]
+    if github_infos:
+        st.caption("GitHub repository analysis: "
+                   f"{sum(info.cached_repos for info in github_infos)} cached, "
+                   f"{sum(info.selected_repos for info in github_infos)} selected per candidate, "
+                   f"{sum(info.deferred_repos for info in github_infos)} deferred, "
+                   f"{sum(info.empty_repos for info in github_infos)} empty, "
+                   f"{sum(info.analysis_failures for info in github_infos)} failed. "
+                   "Shared repositories are scanned once. Deferred repositories are awaiting analysis.")
+
+    ranked = render_candidate_ranking(st, df, include_diag, excel_phone)
+    if ranked is not None:
+        df = ranked
 
     st.download_button(
-        "Download output.csv", data=output_csv_bytes(df, include_diag, excel_phone), file_name="output.csv",
-        mime="text/csv", type="primary",
+        "Download .csv (data only)", data=output_csv_bytes(df, include_diag, excel_phone), file_name="output.csv",
+        mime="text/csv",
     )
     try:
         xlsx_data: bytes | None = output_xlsx_bytes(df, include_diag)
@@ -1080,16 +1350,13 @@ def main() -> None:
         st.info("For the formatted Excel / Google Sheets download, install xlsxwriter:  pip install xlsxwriter")
     if xlsx_data is not None:
         st.download_button(
-            "Download output.xlsx (formatted - best for Google Sheets / Excel)", data=xlsx_data, file_name="output.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            "Download .xlsx (recommended for Google Sheets)", data=xlsx_data, file_name="output.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", type="primary",
         )
-    st.caption("Google Sheets: File > Import > Upload the **.xlsx** to keep column widths, the styled header and phone "
-               "numbers exactly as they are. A .csv cannot carry formatting; if you import the CSV, untick "
-               "'Convert text to numbers, dates and formulas' so Sheets does not drop leading zeros from phones.")
+    st.caption("CSV is data-only: it cannot retain column widths, wrapping, or header styles. For Google Sheets, "
+               "use the XLSX download and File > Import > Upload. If importing CSV, untick 'Convert text to numbers, "
+               "dates and formulas' to preserve phone numbers with leading zeros.")
     csv_cols = output_columns(df, include_diag)
-    st.caption("output.csv / output.xlsx contain: " + ", ".join(csv_cols))
-    st.caption("Save the file with the **Download output.csv** button. The table below shows exactly the same columns "
-               "(no row numbers). Rows that failed show blank cells; their reasons are listed under Failures.")
     # Text only: mixed ""/number columns would otherwise break the table, and the table never shows more than the CSV.
     st.dataframe(df[csv_cols].astype(str), hide_index=True)
 
@@ -1097,83 +1364,6 @@ def main() -> None:
     if len(failed):
         st.subheader("Failures")
         st.dataframe(failed[["phone", "resume_link", "status", "error_stage", "error"]])
-
-    render_profile_filter(st, df, csv_cols, excel_phone)
-    render_file_filter(st, excel_phone)
-
-    st.subheader("Inspector")
-    shown = [p for p in items if p.result is not None][:100]
-    if len(items) > len(shown):
-        st.caption("Showing up to 100 successfully parsed resumes.")
-    for i, p in enumerate(shown):
-        label = f"{p.row['phone'] or '(no phone)'} - {p.row['sections_found'] or 'NO SECTIONS DETECTED'}"
-        with st.expander(label):
-            if p.row["warnings"]:
-                st.warning(p.row["warnings"])
-            left, right = st.columns(2)
-            with left:
-                st.markdown("**Extracted text**")
-                st.text_area("text", p.text, height=420, key=f"raw_{i}", label_visibility="collapsed")
-            with right:
-                st.markdown("**Detected sections**")
-                if p.result.preamble:
-                    st.markdown("`preamble`")
-                    st.code(p.result.preamble, language=None)
-                for s in p.result.metadata:
-                    tag = "" if s.target else " (boundary only, not exported)"
-                    st.markdown(
-                        f"**{s.key}**{tag} - heading `{s.heading}` "
-                        f"@ {s.heading_start}-{s.heading_end}, content {s.start}-{s.end}"
-                    )
-                    st.code(s.text or "(empty)", language=None)
-            if p.row["github_profile"]:
-                st.markdown("**GitHub**")
-                if p.profile_search is not None and p.profile_search.candidates:
-                    st.write(f"Profile confidence: {p.profile_search.confidence}  |  evidence: " + p.profile_search.describe())
-                if p.github is not None and p.github.status:
-                    st.write(
-                        f"{p.row['github_profile']}  |  repositories: {p.row['repos_count'] or '-'}  |  "
-                        f"status: {p.github.status}"
-                    )
-                    st.write("Project categories: " + (p.row["project_categories"] or "-"))
-                    st.write("Tech stack: " + (p.row["github_tech_stack"] or "-"))
-                    if p.row["github_notes"]:
-                        st.warning(p.row["github_notes"])
-                else:
-                    st.write(p.row["github_profile"])
-            if p.project_result is not None and p.project_result.projects:
-                pr = p.project_result
-                st.markdown(f"**Projects found ({len(pr.projects)})**" + ("  - needs review" if pr.needs_review else ""))
-                st.dataframe(pd.DataFrame([
-                    {
-                        "project": q.name or "(untitled)",
-                        "technologies": ", ".join(q.technologies),
-                        "needs_review": q.needs_review,
-                        "review_reasons": ", ".join(q.review_reasons),
-                        "unrecognized_technologies": ", ".join(q.unrecognized_technologies),
-                        "title_style": q.title_style,
-                        "boundary_reasons": ", ".join(q.boundary_reasons),
-                        "notes": "; ".join(q.notes),
-                        "description": q.description,
-                    }
-                    for q in pr.projects
-                ]))
-                for q in pr.projects:
-                    if q.technology_details:
-                        with st.expander(f"Evidence: {q.name or '(untitled)'}"):
-                            st.dataframe(pd.DataFrame([
-                                {"technology": t.name, "category": t.category, "found_in": ", ".join(t.found_in),
-                                 "matched_text": t.matched_text, "occurrences": t.occurrences, "evidence": t.evidence}
-                                for t in q.technology_details
-                            ]))
-            if p.match_rows:
-                st.markdown(f"**Technologies found ({len(p.match_rows)} mentions)**")
-                cols = ["name", "category", "section", "matched_text", "start", "end",
-                        "match_type", "reason", "evidence"]
-                st.dataframe(pd.DataFrame(p.match_rows)[cols])
-            elif p.row["technologies"] == "" and p.row["tech_ms"] != "":
-                st.caption("No technologies found in this resume.")
-
 
 if __name__ == "__main__":
     main()

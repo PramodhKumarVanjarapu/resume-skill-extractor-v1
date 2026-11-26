@@ -1,5 +1,5 @@
 {
-  "version": 2,
+  "version": 4,
   "categories": {
     "Programming Languages": [
       "Python",
@@ -73,7 +73,14 @@
       "RxJS",
       "MobX",
       "Zustand",
-      "Bulma"
+      "Bulma",
+      "React Router",
+      "Framer Motion",
+      "React Slick",
+      "React Icons",
+      "React Query",
+      "Axios",
+      "Flexbox"
     ],
     "Mobile": [
       "Android",
@@ -141,7 +148,24 @@
       "Pydantic",
       "Jinja",
       "Deno",
-      "Lombok"
+      "Lombok",
+      "Django REST Framework",
+      "REST API",
+      "API Integration",
+      "JSON",
+      "Microservices",
+      "WebRTC",
+      "MERN Stack",
+      "MEAN Stack",
+      "Spring AI",
+      "Eureka",
+      "OpenFeign",
+      "Resilience4j",
+      "Flyway",
+      "Liquibase",
+      "Razorpay",
+      "Zod",
+      "tRPC"
     ],
     "Databases": [
       "MySQL",
@@ -189,7 +213,19 @@
       "IBM Cloud",
       "Alibaba Cloud",
       "OpenShift",
-      "Linode"
+      "Linode",
+      "AWS Lambda",
+      "API Gateway",
+      "Amazon Cognito",
+      "Amazon SNS",
+      "CloudFront",
+      "AWS IAM",
+      "Amazon ECS",
+      "Amazon ECR",
+      "AWS Fargate",
+      "Elastic Beanstalk",
+      "Render",
+      "Cloudinary"
     ],
     "DevOps": [
       "Docker",
@@ -219,13 +255,18 @@
       "ELK Stack",
       "Kibana",
       "Logstash",
-      "SonarQube"
+      "SonarQube",
+      "CI/CD",
+      "PM2",
+      "Zipkin",
+      "Loki"
     ],
     "Messaging": [
       "Apache Kafka",
       "RabbitMQ",
       "ActiveMQ",
-      "Amazon SQS"
+      "Amazon SQS",
+      "BullMQ"
     ],
     "Data Science": [
       "NumPy",
@@ -304,7 +345,18 @@
       "Prompt Engineering",
       "Fine-tuning",
       "Vector Database",
-      "AI Agents"
+      "AI Agents",
+      "AI Automation",
+      "Multi-Agent Systems",
+      "LLMOps",
+      "GitHub Copilot",
+      "Cursor",
+      "Codex",
+      "Groq",
+      "n8n",
+      "Whisper",
+      "Deepgram",
+      "ElevenLabs"
     ],
     "Data & Analytics": [
       "Hadoop",
@@ -317,7 +369,9 @@
       "Power BI",
       "Tableau",
       "Looker",
-      "Microsoft Excel"
+      "Microsoft Excel",
+      "Data Visualization",
+      "Web Scraping"
     ],
     "Tools": [
       "Git",
@@ -343,7 +397,9 @@
       "NetBeans",
       "Adobe XD",
       "Photoshop",
-      "Canva"
+      "Canva",
+      "Insomnia",
+      "Tabnine"
     ],
     "Build Tools": [
       "Maven",
@@ -381,7 +437,20 @@
       "WebdriverIO",
       "LoadRunner",
       "Gatling",
-      "React Testing Library"
+      "React Testing Library",
+      "Manual Testing",
+      "Automation Testing",
+      "API Testing",
+      "STLC",
+      "Regression Testing",
+      "Smoke Testing",
+      "Sanity Testing",
+      "Functional Testing",
+      "Integration Testing",
+      "End-to-End Testing",
+      "UI Testing",
+      "Database Testing",
+      "Exploratory Testing"
     ],
     "Security": [
       "Wireshark",
@@ -397,7 +466,9 @@
       "Unix",
       "CentOS",
       "Debian",
-      "Red Hat"
+      "Red Hat",
+      "Operating Systems",
+      "Linux Administration"
     ],
     "Platforms & CMS": [
       "WordPress",
@@ -418,6 +489,39 @@
       "Unreal Engine",
       "OpenGL",
       "Godot"
+    ],
+    "AI & ML": [
+      "Machine Learning",
+      "Deep Learning",
+      "Computer Vision",
+      "Image Processing",
+      "NLP",
+      "MLOps",
+      "Speech-to-Text",
+      "Text-to-Speech"
+    ],
+    "Networking": [
+      "TCP/IP",
+      "DNS",
+      "DHCP",
+      "Routing",
+      "Switching",
+      "Subnetting",
+      "Network Monitoring"
+    ],
+    "IT Support & Operations": [
+      "Troubleshooting",
+      "Production Monitoring",
+      "Ticketing Tools"
+    ],
+    "Software Engineering": [
+      "SDLC",
+      "Agile",
+      "Scrum",
+      "OOP",
+      "DBMS",
+      "Data Structures and Algorithms",
+      "System Design"
     ]
   },
   "ambiguous_surfaces": [
@@ -473,6 +577,213 @@
     "MCP",
     "Haystack",
     "Bedrock",
-    "RAG"
-  ]
+    "RAG",
+    "ML",
+    "ANN",
+    "CNN",
+    "REST",
+    "Cursor",
+    "Codex",
+    "Routing",
+    "Switching",
+    "Troubleshooting",
+    "Lambda",
+    "Render",
+    "Whisper",
+    "Agile",
+    "Scrum",
+    "Chroma",
+    "Copilot",
+    "SNS",
+    "IAM",
+    "ECS",
+    "ECR",
+    "MEAN",
+    "Loki",
+    "Zod",
+    "Regression",
+    "Smoke",
+    "Sanity",
+    "Functional"
+  ],
+  "implies": {
+    "TensorFlow": [
+      "Deep Learning"
+    ],
+    "PyTorch": [
+      "Deep Learning"
+    ],
+    "Keras": [
+      "Deep Learning"
+    ],
+    "Deep Learning": [
+      "Machine Learning"
+    ],
+    "Scikit-learn": [
+      "Machine Learning"
+    ],
+    "XGBoost": [
+      "Machine Learning"
+    ],
+    "LightGBM": [
+      "Machine Learning"
+    ],
+    "OpenCV": [
+      "Computer Vision"
+    ],
+    "spaCy": [
+      "NLP"
+    ],
+    "NLTK": [
+      "NLP"
+    ],
+    "MLflow": [
+      "MLOps"
+    ],
+    "LangSmith": [
+      "LLMOps"
+    ],
+    "LangChain": [
+      "LLM"
+    ],
+    "LlamaIndex": [
+      "LLM"
+    ],
+    "Ollama": [
+      "LLM"
+    ],
+    "OpenAI API": [
+      "LLM"
+    ],
+    "RAG": [
+      "LLM"
+    ],
+    "LLM": [
+      "Generative AI"
+    ],
+    "LangGraph": [
+      "AI Agents"
+    ],
+    "CrewAI": [
+      "Multi-Agent Systems"
+    ],
+    "AutoGen": [
+      "Multi-Agent Systems"
+    ],
+    "Multi-Agent Systems": [
+      "AI Agents"
+    ],
+    "FAISS": [
+      "Vector Database"
+    ],
+    "Pinecone": [
+      "Vector Database"
+    ],
+    "ChromaDB": [
+      "Vector Database"
+    ],
+    "Weaviate": [
+      "Vector Database"
+    ],
+    "Milvus": [
+      "Vector Database"
+    ],
+    "Qdrant": [
+      "Vector Database"
+    ],
+    "pgvector": [
+      "Vector Database"
+    ],
+    "Power BI": [
+      "Data Visualization"
+    ],
+    "Tableau": [
+      "Data Visualization"
+    ],
+    "Looker": [
+      "Data Visualization"
+    ],
+    "Matplotlib": [
+      "Data Visualization"
+    ],
+    "Seaborn": [
+      "Data Visualization"
+    ],
+    "Plotly": [
+      "Data Visualization"
+    ],
+    "BeautifulSoup": [
+      "Web Scraping"
+    ],
+    "Scrapy": [
+      "Web Scraping"
+    ],
+    "Cypress": [
+      "Automation Testing"
+    ],
+    "Appium": [
+      "Automation Testing"
+    ],
+    "WebdriverIO": [
+      "Automation Testing"
+    ],
+    "Robot Framework": [
+      "Automation Testing"
+    ],
+    "SoapUI": [
+      "API Testing"
+    ],
+    "Django REST Framework": [
+      "Django",
+      "REST API"
+    ],
+    "Linux Administration": [
+      "Linux"
+    ],
+    "ServiceNow": [
+      "Ticketing Tools"
+    ],
+    "React Router": [
+      "React"
+    ],
+    "React Slick": [
+      "React"
+    ],
+    "React Icons": [
+      "React"
+    ],
+    "React Query": [
+      "React"
+    ],
+    "MERN Stack": [
+      "MongoDB",
+      "Express.js",
+      "React",
+      "Node.js"
+    ],
+    "MEAN Stack": [
+      "MongoDB",
+      "Express.js",
+      "Angular",
+      "Node.js"
+    ],
+    "n8n": [
+      "AI Automation"
+    ],
+    "Groq": [
+      "LLM"
+    ],
+    "Spring AI": [
+      "LLM"
+    ],
+    "Whisper": [
+      "Speech-to-Text"
+    ],
+    "Deepgram": [
+      "Speech-to-Text"
+    ],
+    "ElevenLabs": [
+      "Text-to-Speech"
+    ]
+  }
 }

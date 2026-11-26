@@ -63,7 +63,8 @@ SECTION_ALIASES: dict[str, tuple[str, ...]] = {
         "technical expertise", "skills and tools", "skills and technologies",
         "skill set", "skillset", "areas of expertise", "it skills",
         "computer skills", "programming skills", "professional skills",
-        "technical skills and tools", "technical skill set",
+        "technical skills and tools", "technical skill set", "core technical skills",
+        "technical skills summary", "key competencies",
     ),
     "projects": (
         "projects", "project", "academic projects", "academic project",
@@ -72,17 +73,19 @@ SECTION_ALIASES: dict[str, tuple[str, ...]] = {
         "project experience", "technical projects", "project work",
         "projects undertaken", "side projects", "college projects",
         "relevant projects", "software projects", "mini projects",
+        "key engineering projects", "engineering projects", "featured projects",
+        "technical project", "major project", "projects portfolio",
     ),
     "experience": (
         "experience", "professional experience", "work experience",
         "employment history", "work history", "employment",
         "employment experience", "career history", "relevant experience",
         "industry experience", "professional background",
-        "work experience details",
+        "work experience details", "other work experience", "other experience",
     ),
     "internships": (
         "internships", "internship", "internship experience",
-        "industrial training", "internships and training",
+        "industrial training", "internships and training", "externship", "externships",
     ),
     "education": (
         "education", "educational qualifications", "educational qualification",
@@ -104,12 +107,14 @@ SECTION_ALIASES: dict[str, tuple[str, ...]] = {
         "honours and awards", "achievements and awards",
         "awards and achievements", "key achievements", "notable achievements",
         "honors", "honours", "recognition", "scholarships and awards",
+        "competitions", "hackathons", "hackathons and competitions",
     ),
     "summary": (
         "summary", "professional summary", "career summary",
         "executive summary", "profile", "professional profile",
         "career profile", "career objective", "objective", "about me",
-        "personal summary", "summary of qualifications",
+        "personal summary", "summary of qualifications", "profile summary",
+        "professional overview", "career overview", "summary profile",
     ),
 }
 
@@ -125,6 +130,10 @@ BOUNDARY_ONLY_ALIASES: tuple[str, ...] = (
     "volunteer work", "leadership", "positions of responsibility",
     "strengths", "soft skills", "links", "contact", "contact information",
     "contact details", "training", "workshops", "conferences", "patents",
+    "research publication", "research publications", "publication",
+    "additional information", "other information", "extracurricular",
+    "coding proficiency", "coding profiles", "coding profile", "coding practice",
+    "competitive programming", "problem solving", "dsa", "online profiles", "problem solving dsa",
 )
 
 # --------------------------------------------------------------------------- #
@@ -139,11 +148,26 @@ _NUMBERING = re.compile(
 )
 _SPACED_LETTERS = re.compile(r"^(?:[^\W\d_] ){2,}[^\W\d_]$")  # "P R O J E C T S"
 _NON_WORD = re.compile(r"[\W_]+")
-_BULLET = re.compile(r"^\s*[•●▪■◦·–—*-]\s+\S")
+# PDF symbol fonts extract bullets as private-use / C1 control characters (U+F0B7, U+0087 ...)
+_BULLET = re.compile(r"^\s*(?:[•●▪■◦·–—*-]\s+|[‣⁃\x80-\x9f-�]\s*)\S")
 # "Heading: optional inline content" -- head is at most 60 chars, no colon.
 _COLON_SPLIT = re.compile(
     r"^(?P<lead>\s*)(?P<head>[^:]{1,60}?)\s*:(?P<gap>\s*)(?P<rest>\S.*)?$"
 )
+# Two-column layout: heading flush left, a wide gap, then content.
+_GAP_SPLIT = re.compile(r"^(?P<head>[A-Za-z][A-Za-z &/]{1,40}?)\s{3,}(?P<rest>\S.*)$")
+# Singular labels with inline content name one item ("Project: X"), not a section.
+_SINGULAR_INLINE = frozenset({"project"})
+
+
+def _ends_mid_sentence(line: str) -> bool:
+    """Does ``line`` look cut off by a hard wrap (so the next line continues it)?
+
+    True when it is non-blank and ends with a lowercase letter or a joining
+    character, e.g. "...for a polished user" or "Python, Java,".
+    """
+    stripped = line.rstrip()
+    return bool(stripped) and (stripped[-1].islower() or stripped[-1] in ",;&/-–—(+")
 
 
 def normalize_heading(raw: str) -> str:
@@ -274,6 +298,7 @@ class SectionDetector:
         for key, aliases in merged.items():
             for alias in aliases:
                 self._lookup[normalize_heading(alias)] = (key, True)
+        self._despaced = {k.replace(" ", ""): v for k, v in self._lookup.items()}
 
     # ------------------------------------------------------------------ #
     def detect(self, text: str) -> SectionResult:
@@ -288,8 +313,8 @@ class SectionDetector:
                 f"resume text must be str, got {type(text).__name__}"
             )
 
-        hits = self._find_headings(text)
-        warnings: list[str] = []
+        hits, rejected = self._find_headings(text)
+        warnings: list[str] = [f"wrapped_line_not_heading:{h.label}" for h in rejected]
         if not hits:
             if text.strip():
                 warnings.append("no_sections_detected")
@@ -333,14 +358,41 @@ class SectionDetector:
         return SectionResult(merged, metadata, preamble, warnings)
 
     # ------------------------------------------------------------------ #
-    def _find_headings(self, text: str) -> list[_Hit]:
+    def _find_headings(self, text: str) -> tuple[list[_Hit], list[_Hit]]:
+        """Return ``(headings, rejected)``.
+
+        A lowercase standalone heading word directly under a line that ends
+        mid-sentence is a hard-wrapped continuation ("...for a polished user"
+        / "experience"), not a heading. This only applies when the resume's
+        other headings are capitalised; a resume that uses lowercase headings
+        (a styling choice) keeps them all.
+        """
         hits: list[_Hit] = []
+        gap_hits: list[_Hit] = []
+        suspects: set[int] = set()
+        lowercase_style = False
+        capitalised_style = False
         offset = 0
+        prev = ""
         for piece in text.splitlines(keepends=True):
             body = piece.splitlines()[0] if piece else ""
             match = self._match_line(body)
+            if match is None and body.strip() and not _BULLET.match(body):
+                gap = self._match_gap(body)
+                if gap is not None:
+                    key, target, label, h_start, h_end, inline = gap
+                    gap_hits.append(_Hit(key, target, label, offset, offset + len(piece),
+                                         offset + h_start, offset + h_end, offset + inline))
             if match is not None:
                 key, target, label, h_start, h_end, inline = match
+                heading = body[h_start:h_end]
+                lowercase = heading[:1].islower()
+                if lowercase and inline is None and _ends_mid_sentence(prev):
+                    suspects.add(len(hits))
+                elif lowercase:
+                    lowercase_style = True
+                else:
+                    capitalised_style = True
                 hits.append(
                     _Hit(
                         key=key,
@@ -354,7 +406,16 @@ class SectionDetector:
                     )
                 )
             offset += len(piece)
-        return hits
+            prev = body
+        rejected: list[_Hit] = []
+        if not (lowercase_style or not capitalised_style or not suspects):
+            rejected = [h for i, h in enumerate(hits) if i in suspects]
+            hits = [h for i, h in enumerate(hits) if i not in suspects]
+        # A two-column "Heading    content" layout is a whole-document style:
+        # one such line alone is far more likely ordinary content.
+        if len(gap_hits) >= 2:
+            hits = sorted(hits + gap_hits, key=lambda h: h.line_start)
+        return hits, rejected
 
     def _match_line(
         self, body: str
@@ -367,7 +428,7 @@ class SectionDetector:
         m = _COLON_SPLIT.match(body)
         if m:
             label = normalize_heading(m.group("head"))
-            entry = self._lookup.get(label)
+            entry = self._resolve(label)
             if entry is None:
                 return None
             rest = m.group("rest")
@@ -375,6 +436,9 @@ class SectionDetector:
             # real target sections. For boundary-only headings it is far more
             # likely to be a line INSIDE another section (a skills block).
             if rest and (not self.allow_inline_content or not entry[1]):
+                return None
+            # "Project: Payments revamp" inside a job entry names ONE project.
+            if rest and label in _SINGULAR_INLINE:
                 return None
             return (
                 entry[0], entry[1], label,
@@ -386,13 +450,82 @@ class SectionDetector:
         if len(core) > self.max_heading_length:
             return None
         label = normalize_heading(core)
-        entry = self._lookup.get(label)
+        entry = self._resolve(label)
+        if entry is None and core.isupper():
+            entry = self._resolve_loose_compound(label)
         if entry is None:
             return None
         return (
             entry[0], entry[1], label,
             len(body) - len(body.lstrip()), len(body.rstrip()), None,
         )
+
+    def _resolve_loose_compound(self, label: str) -> tuple[str, bool] | None:
+        """ALL-CAPS standalone line whose first part is a known target heading and
+        whose other parts are one or two words: "TECHNICAL SKILLS AND INTERSETS"
+        (typo), "PROJECTS AND RESEARCH". Capitals on a line of their own are a
+        strong heading cue, so one unknown short tail is tolerated."""
+        parts = label.split(" and ")
+        if len(parts) < 2:
+            return None
+        first = self._lookup.get(parts[0])
+        if first is None or not first[1] or any(len(p.split()) > 2 for p in parts[1:]):
+            return None
+        return first
+
+    def _match_gap(self, body: str) -> tuple[str, bool, str, int, int, int] | None:
+        """Two-column layout: "Summary        Final-year student ..." (heading
+        flush left, 3+ spaces, content). Only target sections qualify."""
+        if not self.allow_inline_content:
+            return None
+        m = _GAP_SPLIT.match(body)
+        if not m:
+            return None
+        label = normalize_heading(m.group("head"))
+        entry = self._resolve(label)
+        if entry is None or not entry[1] or label in _SINGULAR_INLINE:
+            return None
+        return entry[0], entry[1], label, 0, m.end("head"), m.start("rest")
+
+    def _resolve(self, label: str) -> tuple[str, bool] | None:
+        """Exact alias, letter-spaced alias ("P R O F E S S I O N A L S U M M A R Y"
+        -> "professionalsummary") or compound heading ("projects and experience")."""
+        entry = self._lookup.get(label)
+        if entry is None and label and " " not in label:
+            entry = self._despaced.get(label)
+            if entry is None:
+                # PDF text layers sometimes glue two headings: "PROJECTSEDUCATION"
+                # (the visible heading plus a hidden duplicate). Both halves must be
+                # known headings; the first one is the one that is displayed.
+                entry = next((self._despaced[label[:i]] for i in range(3, len(label) - 2)
+                              if label[:i] in self._despaced and label[i:] in self._despaced), None)
+        return entry if entry is not None else self._resolve_compound(label)
+
+    def _resolve_compound(self, label: str) -> tuple[str, bool] | None:
+        """``"certifications and achievements"`` -> certifications.
+
+        Every part must be a known heading (so "Experience in Python and
+        Java" never qualifies). Projects wins when present, because a mixed
+        "Projects & Experience" section is where the projects are; otherwise
+        the first part decides.
+        """
+        parts = label.split(" and ")
+        if not 2 <= len(parts) <= 4:
+            return None
+        # cover the parts left-to-right; aliases may contain "and" themselves
+        cover: list[list[tuple[str, bool]] | None] = [None] * (len(parts) + 1)
+        cover[0] = []
+        for i in range(len(parts)):
+            if cover[i] is None:
+                continue
+            for j in range(i + 1, len(parts) + 1):
+                entry = self._lookup.get(" and ".join(parts[i:j]))
+                if entry is not None and cover[j] is None:
+                    cover[j] = cover[i] + [entry]
+        entries = cover[-1]
+        if not entries or len(entries) < 2:
+            return None
+        return next((e for e in entries if e[0] == "projects"), entries[0])
 
     @staticmethod
     def _trim(text: str, start: int, end: int) -> tuple[int, int]:

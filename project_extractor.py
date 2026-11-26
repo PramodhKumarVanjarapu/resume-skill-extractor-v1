@@ -81,6 +81,9 @@ _SUBHEADINGS = frozenset({
     "key projects", "major projects", "notable projects", "selected projects", "project experience",
     "technical projects", "project work", "side projects", "college projects", "relevant projects",
     "software projects", "mini projects", "projects undertaken",
+    "highlights", "key highlights", "project highlights",
+    "additional projects", "other projects", "more projects", "minor projects", "additional live deployments",
+    "live deployments", "deployed projects",
 })
 
 _ACTION_VERBS = frozenset("""
@@ -121,7 +124,9 @@ _IGNORED_UNRECOGNIZED = frozenset({"etc", "others", "other", "more", "and more",
 # Regexes
 # --------------------------------------------------------------------------- #
 
-_BULLET = re.compile(r"^[•●▪■◦·►▸➢✓✔»*\-–—]\s+")
+# Glyph bullets may be glued to the text ("●Airline"); ASCII-like ones (*, -, dashes) need a space.
+# PDFs using Symbol/Wingdings fonts extract bullets as private-use characters (U+F0B7 ...).
+_BULLET = re.compile(r"^(?:[•●▪■◦·►▸➢✓✔»\u2023\u2043\x80-\x9f\ue000-\uf8ff\ufffd]\s*|[*\-–—]\s+)(?=\S)")
 _NUMBERING = re.compile(
     r"^(?:(?:project|proj\.?)\s*#?\s*(?P<a>\d{1,2})\s*[:.)\-–—]?|\(?(?P<b>\d{1,2})[.)]|#\s*(?P<c>\d{1,2})"
     r"|(?P<d>\d{1,2})\s*[-–—:])\s+",
@@ -142,6 +147,8 @@ _TRAILING_DATE = re.compile(
 _URL = re.compile(r"(?:https?://|www\.)\S+|\b(?:github|gitlab|bitbucket)\.com/\S+", re.IGNORECASE)
 _URL_ONLY = re.compile(r"^(?:https?://|www\.)\S+$|^(?:github|gitlab|bitbucket)\.com/\S+$", re.IGNORECASE)
 _PIPE = re.compile(r"\s*\|\s*")
+# "Title      Java, Spring Boot" (two-column PDF), "Title · Subtitle", stray PDF glyph separators
+_COLUMN_SPLIT = re.compile(r"\s*\|\s*|\s{3,}|\t+|\s+·\s+|\s*[\x80-\x9f§]\s*")
 _DASH = re.compile(r"\s+[–—-]\s+")
 _COLON = re.compile(r"^(?P<left>[^:]{2,80}?)\s*:\s+(?P<right>\S.*)$")
 _TOKEN_SPLIT = re.compile(r"\s*(?:,|;|/|\||&|•|·|\band\b)\s*", re.IGNORECASE)
@@ -149,6 +156,12 @@ _WORD = re.compile(r"[A-Za-z0-9][A-Za-z0-9.+#'_\-]*")
 _CONTINUATION_WORDS = frozenset(
     "and or with using in on for to of the a an by as via from into like including such &".split()
 )
+_LINK_WORD = r"(?:git\s*hub|github\s+link|live\s*demo|live\s+link|live|demo|source\s+code|code|repo(?:sitory)?|website|deployed|link)"
+_TRAILING_LINK_WORDS = re.compile(rf"(?:[\s|,·§\-–—]*[\[(]?\s*{_LINK_WORD}\s*[\])]?)+\s*$", re.IGNORECASE)
+_LINK_PAREN = re.compile(rf"\s*\(\s*{_LINK_WORD}\b[^)]*\)?", re.IGNORECASE)
+_LINK_WORDS_ONLY = re.compile(rf"^(?:[\[(]?\s*{_LINK_WORD}\s*[\])]?\s*[|,·/§\-–—]*\s*)+$", re.IGNORECASE)
+# a project's own link mentioned mid-line: "Portal  ‡ GitHub — Python, Django"
+_INLINE_LINK = re.compile(r"\b(?:git\s*hub|live\s*demo)\b", re.IGNORECASE)
 _BODY_KINDS = frozenset({"bullet", "sentence", "label_tech", "label_meta", "label_desc", "tech_only", "date", "url"})
 
 
@@ -364,6 +377,11 @@ def _strip_trailing_date(s: str) -> tuple[str, str]:
 def _clean_name(s: str) -> str:
     s = _strip_decor(s)
     s = _URL.sub("", s)
+    s = _LINK_PAREN.sub("", s)                     # "ERP System(GitHub: https://...)"
+    s = re.sub(r"[\x80-\x9f\ue000-\uf8ff§]", " ", s)  # stray PDF glyphs
+    stripped = _TRAILING_LINK_WORDS.sub("", s)     # "MindVault [GitHub] [Live]"
+    if stripped.strip():
+        s = stripped
     s = s.strip().strip("\"'“”‘’")
     s = re.sub(r"\s{2,}", " ", s)
     return s.strip(" \t:–—|,;-")
@@ -523,12 +541,41 @@ class ProjectExtractor:
             return "tech"
         return "desc"
 
+    def _split_name_tech(self, name: str) -> tuple[str, str]:
+        """'Quiz Generator React.js, FastAPI, Python' -> ('Quiz Generator', 'React.js, FastAPI, Python').
+
+        Only a comma-separated tail that is (almost) all technologies is cut, and
+        at least two words of name must remain.
+        """
+        if "," not in name and "|" not in name:
+            return name, ""
+        for m in re.finditer(r"[\s(]+", name):
+            head, tail = name[:m.start()], name[m.end():]
+            if len(_words(head)) < 2 or ("," not in tail and "|" not in tail):
+                continue
+            tail_clean = tail.strip(" ()[]–—-:​").replace(" | ", ", ")
+            found = self.matcher.find_all(tail_clean)
+            # the cut must start exactly at a technology ("Generator React.js, ..." is not a tail)
+            if found and found[0].start == 0 and self._tech_coverage(tail_clean) >= 0.7:
+                if head.count("(") > head.count(")"):      # "System (Core | Java, MySQL)"
+                    head = head[:head.rfind("(")]
+                return head.rstrip(" ,:(–—-"), tail_clean
+        return name, ""
+
     def _try_split(self, text: str) -> _Split | None:
         """'Name | Tech', 'Name - description', 'Name: description' -> pieces."""
         parts: list[str] | None = None
         kind = ""
-        if "|" in text:
-            parts, kind = [p for p in _PIPE.split(text) if p.strip()], "pipe"
+        # "Portal (Django | Python)": a pipe inside parentheses separates technologies, not columns
+        text = re.sub(r"\([^()]*\)", lambda m: m.group(0).replace("|", ","), text)
+        columns = [p for p in _COLUMN_SPLIT.split(text) if p.strip()]
+        if len(columns) >= 2:
+            # pipes, wide gaps (right-aligned tech/date column), spaced middle dots
+            parts, kind = columns, "pipe" if "|" in text else "column"
+            if _DASH.search(parts[0]) and (kind == "column" or not self._title_like(_clean_name(parts[0]))):
+                # "AI Travel Planner — React.js · Node.js": the dash still separates the name
+                head = _DASH.split(parts[0], maxsplit=1)
+                parts = [head[0], head[1], *parts[1:]]
         elif _DASH.search(text):
             first = _DASH.split(text, maxsplit=1)
             parts, kind = [first[0], first[1]], "dash"
@@ -541,7 +588,11 @@ class ProjectExtractor:
         name, name_date = _strip_trailing_date(_clean_name(parts[0]))
         if not name or not self._title_like(name):
             return None
-        sp = _Split(name=_clean_name(name), kind=kind, dates=name_date)
+        # "Java 17        Jan 2024" / "Spring Boot | MySQL": a technology column, not a project name
+        if self._tech_coverage(name) >= 0.6 and not any(w.lower() in _PROJECT_NOUNS for w in _words(name)):
+            return None
+        name, name_tech = self._split_name_tech(name)
+        sp = _Split(name=_clean_name(name), kind=kind, dates=name_date, tech=name_tech)
         for part in parts[1:]:
             role = self._role_of(part)
             if role == "date":
@@ -600,6 +651,14 @@ class ProjectExtractor:
             group = None
 
             if bullet_m:
+                # "● Airline Booking System — Python, MySQL — GitHub": a one-line project
+                # (its own tech list AND its own link), not a description bullet.
+                if _TRAILING_LINK_WORDS.search(body) or _URL.search(body) or _INLINE_LINK.search(body):
+                    split = self._try_split(body)
+                    if split is not None and (split.tech or split.desc):
+                        ln.kind, ln.split, ln.text, ln.bullet = "cand", split, split.name, True
+                        ln.dates, ln.links = split.dates, list(split.links)
+                        continue
                 ln.kind, ln.text, ln.bullet = "bullet", _strip_decor(body), True
                 continue
 
@@ -614,7 +673,7 @@ class ProjectExtractor:
             if _DATE_ONLY.match(body):
                 ln.kind, ln.text = "date", body
                 continue
-            if _URL_ONLY.match(body):
+            if _URL_ONLY.match(body) or _LINK_WORDS_ONLY.match(body):
                 ln.kind, ln.text = "url", body
                 continue
 
@@ -627,15 +686,26 @@ class ProjectExtractor:
             if _is_sentence(body):
                 ln.kind, ln.text = "sentence", body
                 continue
-            if self._tech_coverage(body) >= 0.6 and (re.search(r"[,;/|]", body) or self._tech_coverage(body) >= 0.85):
-                ln.kind, ln.text = "tech_only", body
+            # technology lines: judged without a trailing date ("WebSocket     2024-25") and
+            # by their first column ("PHP, MySQL, Bootstrap  | Full-stack architecture ...")
+            core, _ = _strip_trailing_date(body)
+            first_col = next((c for c in _COLUMN_SPLIT.split(core) if c.strip()), core)
+            # "AI CRM (Python, FastAPI, React": a name followed by its technologies
+            named = core.split("(")[0] if "(" in core else ""
+            pieces = () if len(_words(named)) >= 2 and self._tech_coverage(named) < 0.5 else (core, first_col)
+            for piece in dict.fromkeys(pieces):
+                coverage = self._tech_coverage(piece)
+                if coverage >= 0.6 and (re.search(r"[,;/|]", piece) or coverage >= 0.85):
+                    ln.kind, ln.text = "tech_only", body
+                    break
+            if ln.kind == "tech_only":
                 continue
 
             name, date = _strip_trailing_date(_clean_name(body))
             if not name or len(_words(name)) > self.max_title_words:
                 ln.kind, ln.text = "sentence", body
                 continue
-            ln.kind, ln.text, ln.dates = "cand", name, date
+            ln.kind, ln.text, ln.dates = "cand", self._split_name_tech(name)[0], date
             ln.links = [m.group(0) for m in _URL.finditer(body)]
 
     # ------------------------------------------------------------------ #
@@ -732,9 +802,32 @@ class ProjectExtractor:
             prev_is_title = prev is not None and cur is not None and prev is cur.title
             flags: list[str] = []
 
-            # --- indentation: deeper than the current title => part of that project
+            # --- a wrapped line is never a title: it continues the line above
+            #     ("...task boards with login" / "separate boards ..."), or finishes
+            #     a title left open with "(" ("CRM (Python, Redux" / "Toolkit)   GitHub").
+            if prev is not None and not blank_before and not bullet_title and ln.numbering is None:
+                open_title = prev_is_title and prev.raw.count("(") > prev.raw.count(")")
+                lowercase_start = ln.raw[:1].islower() and ln.raw[1:2].islower()
+                wrapped = prev_is_body and len(_words(prev.raw)) >= 3 and _is_continuation(prev.raw, ln.raw)
+                # "Podcast Pulse | GitHub" / "GenAI-powered NLP pipeline — LLM, REST API":
+                # a sentence-case line right under a title is its tagline
+                name = ln.split.name if ln.split else ln.text
+                tagline = prev_is_title and ln.kind == "cand" and _cap_ratio(name) < 0.7
+                if open_title or lowercase_start or wrapped or tagline:
+                    (cur.lines if cur else pre).append(ln)
+                    prev, prev_in_body, blank_before = ln, True, False
+                    continue
+
+            # --- indentation: deeper than the current title => part of that project.
+            #     A line shallower than the body line above it is a dedent, not nesting:
+            #     the first title of a section loses its indent when the section text
+            #     is trimmed, so "  Shopping-App | React" under "       • bullets" is a
+            #     new project even though it is deeper than that first title.
+            dedent = prev is not None and prev_is_body and ln.indent < prev.indent
+            # "Name | Java, Spring Boot | GIT" names a project wherever it is indented
+            pipe_with_tech = ln.split is not None and bool(ln.split.tech)
             if cur is not None and cur.title is not None and ln.numbering is None and not bullet_title \
-                    and ln.indent >= cur.title.indent + 2:
+                    and ln.indent >= cur.title.indent + 2 and not dedent and not pipe_with_tech:
                 cur.lines.append(ln)
                 prev, prev_in_body, blank_before = ln, True, False
                 continue

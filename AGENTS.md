@@ -28,6 +28,10 @@ directory.
 | `xlsx_export.py` | Formatted XLSX export. |
 | `dictionaries/` | Technology master list and alias mapping; edit these rather than hard-coding ordinary technology additions. |
 | `test_section_detector.py` | Table-driven `unittest` coverage for section detection. |
+| `test_project_extractor.py` | Project splitting on real-world PDF layouts (synthetic text). |
+| `test_technology_inference.py` | Hiring vocabulary coverage, context-sensitive terms, and inferred (`implies`) skills. |
+| `test_repository_analysis.py` | GitHub repository technology extraction, stack classification, exclusion and duplicate rules on synthetic repositories. |
+| `test_*.py` (others) | Ranker, CSV export, evidence, GitHub scan and repository filter tests. |
 
 ## Run and verify
 
@@ -42,20 +46,26 @@ streamlit run app.py
 The core extractor modules use only the Python standard library. The UI and
 exports additionally use the packages listed in `requirements.txt`.
 
-Run the current test file directly after correcting its stale import path if
-needed:
+Run the tests from the repository root:
 
 ```powershell
-python test_section_detector.py
+python -m unittest test_section_detector test_project_extractor test_technology_inference test_candidate_ranker test_csv_export test_evidence_features test_github_api_scan test_repository_filter test_repository_analysis
+python test_section_detector.py   # section-detector report with precision/recall and timing
 ```
 
-Important: `README.md`, comments, and `test_section_detector.py` still refer
-to an old `app/` directory and `tests/` package. The repository now stores the
-modules and test at its root. `test_section_detector.py` currently inserts the
-parent's nonexistent `app/` directory into `sys.path`, so it may fail to import
-`section_detector` unless the repository root is already on `PYTHONPATH` or
-that path setup is fixed. Keep documentation and tests aligned with the flat
-layout whenever touching this area.
+`test_section_detector.py` skips its end-to-end case when the optional
+`sample_resumes/sample_resume.txt` is absent (sample resumes contain personal
+data and are not committed).
+
+Important: `README.md` and some comments still refer to an old `app/`
+directory and `tests/` package. The repository stores the modules and tests at
+its root. Keep documentation and tests aligned with the flat layout whenever
+touching this area.
+
+Inferred skills live in the `implies` map of
+`dictionaries/technologies_master.json` (e.g. PyTorch -> Deep Learning ->
+Machine Learning). Keep rules narrow: a rule that fires for most candidates
+(as Postman -> API Testing did) makes filters useless.
 
 ## Engineering conventions
 

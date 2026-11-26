@@ -8,6 +8,7 @@
 # GitHub analysis cache written by app/analyzer.py
 tech-cache.json
 tech-cache.json.tmp
+logs/
 # Exports contain phone numbers: keep every CSV out of the repo
 *.csv
 

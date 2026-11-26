@@ -7,12 +7,12 @@ Adds four things to each resume's row:
     github_tech_stack    technologies detected across those repositories
     project_categories   repository categories with counts, e.g. "MERN (3); Frontend (2)"
 
-The heavy lifting is done by two files that are used UNCHANGED:
+The heavy lifting is done by two files:
 
     resume.py     finds GitHub profiles in a resume, including links that are hidden
                   behind text such as "GitHub" (PDF annotations, DOCX relationships)
-    analyzer.py   lists a profile's repositories (GitHub API), clones each one without
-                  file contents, detects technologies, and computes the categories
+    analyzer.py   lists a profile's repositories, scans selected files by Git clone
+                  or authenticated GitHub API, and detects technologies and categories
 
 This module only connects them to the rest of the extractor:
 
@@ -31,7 +31,7 @@ gracefully by itself: the first ~60 profiles succeed and every later one fails. 
 result of ``rate_limit_status`` to ``analyze_profiles`` (``max_profiles`` / ``rate``) so
 profiles that cannot fit are skipped with a clear reason instead.
 
-Needs network access to api.github.com and github.com, and the ``git`` command.
+Both modes need network access. Clone mode also needs the ``git`` command.
 """
 
 from __future__ import annotations
@@ -43,12 +43,14 @@ import time
 from collections import Counter
 from contextlib import contextmanager
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Callable, Iterable
 
-import requests
-
 import analyzer
+from analyzer import (
+    DEFAULT_PARALLEL_GITHUB_REQUESTS, MAX_PARALLEL_GITHUB_REQUESTS,
+    GitHubAuthorization, GitHubCredentials, RepositoryScanMethod,
+)
 import github_profile
 import resume as resume_reader
 from github_profile import ProfileSearch, find_profile_candidates, guess_name
@@ -56,6 +58,8 @@ from github_profile import ProfileSearch, find_profile_candidates, guess_name
 logger = logging.getLogger(__name__)
 
 __all__ = [
+    "DEFAULT_PARALLEL_GITHUB_REQUESTS",
+    "MAX_PARALLEL_GITHUB_REQUESTS",
     "GITHUB_COLUMNS",
     "MAX_FALLBACKS",
     "MAX_REPOS_PER_ACCOUNT",
@@ -64,7 +68,10 @@ __all__ = [
     "find_profile_candidates",
     "guess_name",
     "GitHubInfo",
+    "GitHubAuthorization",
+    "GitHubCredentials",
     "RateLimit",
+    "RepositoryScanMethod",
     "analyze_profiles",
     "extract_links",
     "find_profiles",
@@ -86,8 +93,47 @@ MAX_REPOS_PER_ACCOUNT = 100
 
 GITHUB_COLUMNS = [
     "github_profile", "repos_count", "github_tech_stack", "project_categories",
-    "github_status", "github_notes",
+    "github_status", "github_notes", "github_cached_repos", "github_selected_repos",
+    "github_deferred_repos", "github_empty_repos", "github_analysis_failures",
+    "github_deferred_repository_names",
 ]
+
+
+def repository_activity(repo: dict, now: datetime | None = None) -> dict:
+    """Classify repository push/commit activity, never metadata-only updates."""
+    now = now or datetime.now(timezone.utc)
+    when, source = None, ""
+    for field in ("last_commit_at", "pushed_at"):
+        value = repo.get(field)
+        if not value:
+            continue
+        try:
+            parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+            if parsed.tzinfo is None:
+                continue
+            when, source = parsed.astimezone(timezone.utc), field
+            break
+        except ValueError:
+            continue
+    if when is None or when > now:
+        status = "unknown"
+    else:
+        days = (now - when).total_seconds() / 86400
+        status = "recent" if days <= 90 else "active" if days <= 180 else "older" if days <= 365 else "inactive"
+    return {"repository": repo.get("repository", ""), "last_activity_date": when.date().isoformat() if when else "",
+            "activity_status": status, "activity_date_source": source,
+            "created_at": repo.get("created_at"), "updated_at": repo.get("updated_at"),
+            "pushed_at": repo.get("pushed_at"), "last_commit_at": repo.get("last_commit_at"),
+            "archived": bool(repo.get("archived")), "fork": bool(repo.get("fork"))}
+
+
+def activity_summary(repositories: list[dict], now: datetime | None = None) -> dict:
+    activity = [repository_activity(repo, now) for repo in repositories]
+    counts = Counter(item["activity_status"] for item in activity)
+    dates = [item["last_activity_date"] for item in activity if item["last_activity_date"]]
+    return {"total_repositories": len(repositories), **{f"{key}_repositories_count": counts[key]
+            for key in ("recent", "active", "older", "inactive", "unknown")},
+            "most_recent_github_activity": max(dates, default=""), "repositories": activity}
 
 
 def git_available() -> bool:
@@ -148,19 +194,18 @@ class RateLimit:
         return max(self.remaining - reserve, 0)
 
 
-def rate_limit_status(token: str | None = None, timeout: float = 10) -> RateLimit | None:
+def rate_limit_status(token: GitHubAuthorization = None, timeout: float = 10) -> RateLimit | None:
     """Current API quota, or ``None`` if it cannot be determined (offline, bad token, ...)."""
-    headers = {"Accept": "application/vnd.github+json", "X-GitHub-Api-Version": "2022-11-28"}
-    if token:
-        headers["Authorization"] = f"Bearer {token}"
+    analyzer.configure_logging()
+    credentials = GitHubCredentials.from_token(token)
     try:
-        r = requests.get("https://api.github.com/rate_limit", headers=headers, timeout=timeout)
+        r = credentials.get("https://api.github.com/rate_limit", timeout=timeout, count=False)
         if r.status_code != 200:
             return None
         core = r.json()["resources"]["core"]
-        return RateLimit(int(core["limit"]), int(core["remaining"]), int(core["reset"]), bool(token))
+        return RateLimit(int(core["limit"]), int(core["remaining"]), int(core["reset"]), credentials.authenticated)
     except Exception as exc:  # noqa: BLE001 - the quota check is advisory
-        logger.debug("could not read the GitHub rate limit: %s", exc)
+        logger.debug("could not read the GitHub rate limit: %s", type(exc).__name__)
         return None
 
 
@@ -170,7 +215,7 @@ def _limit_note(rate: RateLimit | None) -> str:
     kind = "with a token" if rate.authenticated else "without a token (limit 60/hour)"
     return (
         f"Skipped: only {rate.remaining} of {rate.limit} GitHub API requests were left {kind}; resets at "
-        f"{rate.reset_text()}. Add a GitHub token (5,000/hour) or re-run after the reset"
+        f"{rate.reset_text()}. Re-run after the reset"
     )
 
 
@@ -182,34 +227,29 @@ _REAL_LIST = analyzer.list_repositories      # the analyzer's own function, capt
 _RUN_LOCK = threading.Lock()                 # analyzer.list_repositories is swapped during a run: one run at a time
 
 
-def _paged_listing(username: str, token: str | None, skip_forks: bool, max_repos: int | None, truncated: dict) -> list[dict]:
+def _paged_listing(username: str, token: GitHubAuthorization, skip_forks: bool,
+                   max_repos: int | None, truncated: dict) -> list[dict]:
     """``analyzer.list_repositories`` with two additions (identical results and errors otherwise; see the parity tests):
 
     * the owner of the first repository tells whether the account is an Organization: that is refused after ONE
       request (GitHub already put ``owner.type`` in the page we fetched, so this costs nothing extra);
     * paging stops as soon as more than ``max_repos`` usable repositories are known; the most recently updated
-      ``max_repos`` are kept and the account is recorded in ``truncated``.
+      ``max_repos`` are listed for metadata prioritization and the account is recorded in ``truncated``.
     """
-    headers = {"Accept": "application/vnd.github+json", "X-GitHub-Api-Version": "2022-11-28"}
-    if token:
-        headers["Authorization"] = f"Bearer {token}"
+    credentials = GitHubCredentials.from_token(token)
     repos: list[dict] = []
     page = 1
     while True:
-        r = analyzer.requests.get(
+        request_started = time.perf_counter()
+        r = credentials.get(
             f"https://api.github.com/users/{username}/repos",
             params={"type": "owner", "per_page": 100, "page": page, "sort": "updated"},
-            headers=headers,
-            timeout=30,
         )
+        logger.debug("api=list_repositories status=%d duration=%.3fs remaining=%s",
+                     r.status_code, time.perf_counter() - request_started,
+                     r.headers.get("x-ratelimit-remaining", "unknown"))
         if r.status_code == 404:
             raise analyzer.GitHubError("GitHub user not found")
-        if r.status_code == 401:
-            raise analyzer.GitHubError("GitHub token is invalid or expired")
-        if r.status_code == 429 or (r.status_code == 403 and r.headers.get("x-ratelimit-remaining") == "0"):
-            reset = r.headers.get("x-ratelimit-reset")
-            when = datetime.fromtimestamp(int(reset)).strftime("%I:%M %p") if reset else "later"
-            raise analyzer.GitHubError(f"GitHub rate limit reached. Add a GitHub token or try again after {when}")
         r.raise_for_status()
 
         batch = r.json()
@@ -237,7 +277,7 @@ def _guarded_listing(max_repos: int | None, truncated: dict):
         current = analyzer.list_repositories
         use_paging = current is _REAL_LIST
 
-        def guarded(username: str, token: str | None, skip_forks: bool = True) -> list[dict]:
+        def guarded(username: str, token: GitHubAuthorization, skip_forks: bool = True) -> list[dict]:
             if use_paging:
                 return _paged_listing(username, token, skip_forks, max_repos, truncated)
             repos = current(username, token, skip_forks)
@@ -266,6 +306,17 @@ class GitHubInfo:
     categories: list[tuple[str, int]] = field(default_factory=list)  # (category, repository count)
     notes: list[str] = field(default_factory=list)
     others: list[str] = field(default_factory=list)                # other accounts found in the resume, not analysed
+    repositories: list[dict] = field(default_factory=list)
+    cached_repos: int = 0
+    selected_repos: int = 0
+    deferred_repos: int = 0
+    empty_repos: int = 0
+    analysis_failures: int = 0
+    deferred_names: list[str] = field(default_factory=list)
+    analysis_metrics: dict = field(default_factory=dict)
+    # Repositories left out of tech_stack / categories: {"repository", "reason"} (profile_readme, coding_practice,
+    # tutorial_or_assignment, no_source_code, minimal_implementation, empty_repository, duplicate_of:<repo>)
+    exclusions: list[dict] = field(default_factory=list)
 
     def columns(self) -> dict[str, str | int]:
         """CSV cells. Lists are '; '-separated like the other technology columns."""
@@ -276,17 +327,27 @@ class GitHubInfo:
             "project_categories": analyzer.format_categories(self.categories),
             "github_status": self.status,
             "github_notes": "; ".join(self.notes),
+            "github_cached_repos": self.cached_repos, "github_selected_repos": self.selected_repos,
+            "github_deferred_repos": self.deferred_repos, "github_empty_repos": self.empty_repos,
+            "github_analysis_failures": self.analysis_failures,
+            "github_deferred_repository_names": "; ".join(self.deferred_names),
         }
 
 
 def _analyze_round(
     profile_lists: list[list[str]],
-    token: str | None = None,
+    token: GitHubAuthorization = None,
     skip_forks: bool = True,
     on_progress: Callable[[int, int], None] | None = None,
     max_profiles: int | None = None,
     rate: RateLimit | None = None,
     max_repos: int | None = MAX_REPOS_PER_ACCOUNT,
+    required_groups: tuple[tuple[str, ...], ...] = (),
+    initial_repo_budget: int | None = analyzer.MAX_INITIAL_REPOS_PER_CANDIDATE,
+    exhaustive: bool = False,
+    needs_more_evidence: Callable[[dict, list[dict]], bool] | None = None,
+    *,
+    scan_method: RepositoryScanMethod = "clone",
 ) -> list[GitHubInfo]:
     """One pass over the given profiles (every profile in every list is analysed; see ``analyze_profiles``).
 
@@ -340,7 +401,10 @@ def _analyze_round(
     truncated: dict[str, int] = {}
     try:
         with _guarded_listing(max_repos, truncated):
-            analyzer.run_report(people, token or None, skip_forks, progress)
+            analyzer.run_report(people, token, skip_forks, progress,
+                                scan_method=scan_method,
+                                required_groups=required_groups, initial_repo_budget=initial_repo_budget,
+                                exhaustive=exhaustive, needs_more_evidence=needs_more_evidence)
     except Exception as exc:  # noqa: BLE001 - e.g. git missing, disk full
         logger.exception("GitHub analysis failed")
         for info in owners:
@@ -353,15 +417,32 @@ def _analyze_round(
         if info.status == "done":
             info.repos_count = person["repositories"]
         info.tech_stack = list(person["technologies"])
+        info.repositories = list(person.get("repository_results", []))
+        info.cached_repos = person.get("repositories_cached", 0)
+        info.selected_repos = person.get("repositories_selected", 0)
+        info.deferred_repos = person.get("repositories_deferred", 0)
+        info.empty_repos = person.get("repositories_skipped_empty", 0)
+        info.analysis_failures = person.get("failed_repos", 0)
+        info.deferred_names = list(person.get("deferred_repository_names", []))
+        info.analysis_metrics = dict(person.get("analysis_metrics", {}))
         info.categories = [(name, count) for name, count in person["categories"]]
+        info.exclusions = list(person.get("repository_exclusions", []))
         info.notes = list(person["errors"])
+        if info.exclusions:
+            reasons = Counter(item["reason"].split(":", 1)[0].replace("_", " ") for item in info.exclusions)
+            info.notes.append(f"{len(info.exclusions)} repositories not counted as projects ("
+                              + ", ".join(f"{reason}: {count}" for reason, count in reasons.most_common()) + ")")
+        if info.deferred_names:
+            info.notes.append(f"{len(info.deferred_names)} repositories not yet analyzed; technology coverage is partial")
         if person["failed_repos"]:
             info.notes.append(f"{person['failed_repos']} repos could not be read")
+            if scan_method == "api":
+                info.notes.extend(dict.fromkeys(repo["error"] for repo in info.repositories if repo.get("error")))
         for user in person["profiles"]:
             if user.lower() in truncated:
                 info.notes.append(
                     f"{user}: more than {truncated[user.lower()]} repositories, so only the "
-                    f"{truncated[user.lower()]} most recently updated were analysed"
+                    f"{truncated[user.lower()]} most recently updated were listed for prioritization"
                 )
         if person.get("_dropped"):
             info.notes.append("Not analysed (GitHub API limit): " + ", ".join(person["_dropped"]))
@@ -377,7 +458,7 @@ def _unusable(info: GitHubInfo) -> bool:
 
 def analyze_profiles(
     profile_lists: list[list[str]],
-    token: str | None = None,
+    token: GitHubAuthorization = None,
     skip_forks: bool = True,
     on_progress: Callable[[int, int], None] | None = None,
     max_profiles: int | None = None,
@@ -385,6 +466,12 @@ def analyze_profiles(
     all_profiles: bool = False,
     fallback: bool = True,
     max_repos: int | None = MAX_REPOS_PER_ACCOUNT,
+    required_groups: tuple[tuple[str, ...], ...] = (),
+    initial_repo_budget: int | None = analyzer.MAX_INITIAL_REPOS_PER_CANDIDATE,
+    exhaustive: bool = False,
+    needs_more_evidence: Callable[[dict, list[dict]], bool] | None = None,
+    *,
+    scan_method: RepositoryScanMethod = "clone",
 ) -> list[GitHubInfo]:
     """Analyse the GitHub account of many resumes at once.
 
@@ -393,18 +480,20 @@ def analyze_profiles(
     account a resume mentions mixes other people's work into the tech stack. The remaining usernames are kept in
     ``info.others`` and named in the notes. ``all_profiles=True`` restores the merge of every account.
 
-    ``max_repos`` caps the repositories analysed per account (``None`` = no cap): accounts with more get their most
-    recently updated ones, and GitHub organisations (``google``, ``linkedin``, ...) are refused after one request.
+    ``max_repos`` caps the repositories listed per account (``None`` = no cap): accounts with more expose only their most
+    recently updated ones to prioritization, and GitHub organisations are refused after one request.
 
     ``fallback``: when the chosen account does not exist on GitHub, or is an organisation, the next candidate is
     tried (up to ``MAX_FALLBACKS`` times) and the notes say so. The result is aligned with ``profile_lists``; every repository is
     analysed once even if several resumes share it; nothing here raises (see ``status`` and ``notes``).
     ``on_progress``, ``max_profiles`` and ``rate`` are as in ``_analyze_round``: the budget counts distinct accounts,
     so with the default it counts one per resume.
+    ``scan_method="api"`` uses the token for repository contents as well as listing.
     """
     full = [list(dict.fromkeys(pl)) for pl in profile_lists]
     chosen = full if all_profiles else [pl[:1] for pl in full]
-    infos = _analyze_round(chosen, token, skip_forks, on_progress, max_profiles, rate, max_repos)
+    infos = _analyze_round(chosen, token, skip_forks, on_progress, max_profiles, rate, max_repos,
+                           required_groups, initial_repo_budget, exhaustive, needs_more_evidence, scan_method=scan_method)
     remaining = [
         [u for u in pl if u.lower() not in {p.lower() for p in info.profiles}] for pl, info in zip(full, infos)
     ]
@@ -414,7 +503,9 @@ def analyze_profiles(
             retry = [i for i, info in enumerate(infos) if info.status == "failed" and _unusable(info) and remaining[i]]
             if not retry:
                 break
-            redo = _analyze_round([[remaining[i][0]] for i in retry], token, skip_forks, on_progress, None, rate, max_repos)
+            redo = _analyze_round([[remaining[i][0]] for i in retry], token, skip_forks, on_progress, None, rate,
+                                  max_repos, required_groups, initial_repo_budget, exhaustive, needs_more_evidence,
+                                  scan_method=scan_method)
             for i, new in zip(retry, redo):
                 reason = "is an organisation, not a person" if any("organisation" in n.lower() for n in infos[i].notes) else "was not found on GitHub"
                 new.notes.insert(0, f"{infos[i].profiles[0]} {reason}; analysed {new.profiles[0]} instead")
@@ -431,17 +522,19 @@ def analyze_profiles(
 def summarize(infos: Iterable[GitHubInfo]) -> dict[str, int]:
     """How many resumes ended in each outcome (only non-zero keys), for a post-run message.
 
-    Keys: done, no_github_profile, skipped_rate_limit, rate_limited (the quota ran out DURING the
-    run), organisation (the account is a GitHub organisation, not a person), user_not_found, bad_token,
-    failed_other.
+    The repository_rate_limited count can overlap with done when some repository scans hit the API quota.
     """
     counts: Counter[str] = Counter()
     for info in infos:
         if info.status in ("done", "no_github_profile", "skipped_rate_limit"):
             counts[info.status] += 1
+            if info.status == "done" and info.analysis_metrics.get("scan_method") == "api" and any(
+                "rate limit" in repo.get("error", "").lower() for repo in info.repositories
+            ):
+                counts["repository_rate_limited"] += 1
         elif info.status == "failed":
             text = " ".join(info.notes).lower()
-            if "rate limit" in text or "403" in text or "429" in text:
+            if "rate limit" in text:
                 counts["rate_limited"] += 1
             elif "token is invalid" in text:
                 counts["bad_token"] += 1

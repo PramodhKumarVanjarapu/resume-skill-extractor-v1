@@ -38,9 +38,33 @@ COLUMN_WIDTHS: dict[str, int] = {
     "status": 12, "error_stage": 14, "error": 40, "projects_needs_review": 14, "projects_summary": 60,
     "unrecognized_technologies": 36, "github_status": 20, "github_notes": 50, "warnings": 40,
     "raw_text": 60,
+    "technology_match_percentage": 22, "evidence_score": 18, "priority": 18,
+    "matched_requirements": 48, "missing_requirements": 48, "matched_alternative_groups": 48,
+    "github_matched_technologies": 44, "project_matched_technologies": 44,
+    "experience_matched_technologies": 44, "optional_matches": 40, "ranking_reason": 60,
+    "ranking_warnings": 52,
+    "total_projects": 16, "matching_projects_count": 24, "matching_project_names": 48,
+    "project_threshold_met": 22, "technology_threshold_met": 24, "shortlisting_eligible": 22,
+    "screening_status": 20, "unverified_requirements": 48,
+    "github_evidence_details": 60, "verified_project_repositories": 60,
+    "project_repo_match_confidence": 36, "experience_evidence_details": 60,
+    "internship_evidence_details": 60, "recent_repositories_count": 22,
+    "active_repositories_count": 22, "older_repositories_count": 22,
+    "inactive_repositories_count": 24, "unknown_repositories_count": 24,
+    "most_recent_github_activity": 26,
+    "repository_activity_details": 60, "evidence_review_flags": 50,
+    "github_cached_repos": 22, "github_selected_repos": 22, "github_deferred_repos": 22,
+    "github_empty_repos": 20, "github_analysis_failures": 24,
+    "github_deferred_repository_names": 54,
 }
 DEFAULT_WIDTH = 30
-NUMERIC_COLUMNS = frozenset({"num_projects", "repos_count"})
+NUMERIC_COLUMNS = frozenset({"num_projects", "repos_count", "technology_match_percentage",
+                             "evidence_score", "matched_mandatory_groups", "total_mandatory_groups",
+                             "total_projects", "matching_projects_count"})
+NUMERIC_COLUMNS = NUMERIC_COLUMNS | {"recent_repositories_count", "active_repositories_count",
+                                     "older_repositories_count", "inactive_repositories_count",
+                                     "unknown_repositories_count", "github_cached_repos", "github_selected_repos",
+                                     "github_deferred_repos", "github_empty_repos", "github_analysis_failures"}
 URL_COLUMNS = frozenset({"resume_link", "github_profile"})
 TEXT_COLUMNS = frozenset({"phone"})
 
@@ -92,6 +116,13 @@ def dataframe_to_xlsx(
     text_fmt = workbook.add_format({"num_format": "@", "valign": "top"})          # phone: always text
     number_fmt = workbook.add_format({"valign": "top", "align": "center"})
     link_fmt = workbook.add_format({"font_color": "#0563C1", "underline": 1, "valign": "top", "text_wrap": True})
+    priority_formats = {
+        "P1": workbook.add_format({"bg_color": "#D9EAD3", "valign": "top"}),
+        "P2": workbook.add_format({"bg_color": "#FFF2CC", "valign": "top"}),
+        "P3": workbook.add_format({"bg_color": "#FCE5CD", "valign": "top"}),
+        "Below Threshold": workbook.add_format({"bg_color": "#E7E6E6", "valign": "top"}),
+        "Pending Analysis": workbook.add_format({"bg_color": "#D9EAF7", "valign": "top"}),
+    }
 
     sheet.set_row(0, 24)
     for c, name in enumerate(cols):
@@ -104,8 +135,10 @@ def dataframe_to_xlsx(
             text = _cell_text(raw)
             if text == "":
                 sheet.write_blank(r, c, None, body_fmt)
-            elif name in NUMERIC_COLUMNS and re.fullmatch(r"\d+", text):
-                sheet.write_number(r, c, int(text), number_fmt)
+            elif name in NUMERIC_COLUMNS and re.fullmatch(r"\d+(?:\.\d+)?", text):
+                sheet.write_number(r, c, float(text), number_fmt)
+            elif name == "priority" and text in priority_formats:
+                sheet.write_string(r, c, text, priority_formats[text])
             elif (name in URL_COLUMNS and _SINGLE_URL.fullmatch(text)
                   and len(text) <= MAX_URL_CHARS and urls_written < MAX_URLS):
                 sheet.write_url(r, c, text, link_fmt, string=text)
